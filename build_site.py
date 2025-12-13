@@ -2,6 +2,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -514,23 +516,260 @@ def render_message_index_page(conv: dict, msg: dict, target_url: str) -> str:
 </html>
 """
 
+def _detect_brotli():
+    try:
+        import brotli  # type: ignore
 
-def main():
+        return ("python", brotli)
+    except Exception:
+        pass
+
+    try:
+        import brotlicffi as brotli  # type: ignore
+
+        return ("python", brotli)
+    except Exception:
+        pass
+
+    exe = shutil.which("brotli")
+    if exe:
+        return ("cli", exe)
+    return (None, None)
+
+
+def _should_brotli_path(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    if path.name.endswith(".br"):
+        return False
+    if path.name.endswith(".gz"):
+        return False
+    if path.name.startswith("."):
+        return False
+
+    suffix = path.suffix.lower()
+    if suffix in {".html", ".css", ".js", ".json", ".txt", ".svg", ".xml", ".map"}:
+        return True
+    if suffix in {".wasm"}:
+        return True
+
+    # Pagefind outputs
+    if path.name.endswith(".pf_meta") or path.name.endswith(".pf_fragment"):
+        return True
+    if path.name.endswith(".pagefind"):
+        return True
+
+    return False
+
+
+def _brotli_mode_for_path(brotli_mod, path: Path):
+    suffix = path.suffix.lower()
+    is_text = suffix in {".html", ".css", ".js", ".json", ".txt", ".svg", ".xml", ".map"}
+    if is_text and hasattr(brotli_mod, "MODE_TEXT"):
+        return brotli_mod.MODE_TEXT
+    if hasattr(brotli_mod, "MODE_GENERIC"):
+        return brotli_mod.MODE_GENERIC
+    return None
+
+
+def _maybe_write_brotli_file(
+    src: Path,
+    quality: int,
+    lgwin: int,
+    brotli_kind,
+    brotli_impl,
+    *,
+    min_savings_ratio: float = 0.01,
+) -> bool:
+    dst = src.with_name(src.name + ".br")
+
+    try:
+        src_stat = src.stat()
+    except FileNotFoundError:
+        return False
+
+    if dst.exists():
+        try:
+            dst_stat = dst.stat()
+            if dst_stat.st_mtime >= src_stat.st_mtime and dst_stat.st_size > 0:
+                return False
+        except FileNotFoundError:
+            pass
+
+    tmp = dst.with_name(dst.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    if brotli_kind == "python":
+        brotli_mod = brotli_impl
+        mode = _brotli_mode_for_path(brotli_mod, src)
+        compressor_kwargs = {"quality": quality, "lgwin": lgwin}
+        if mode is not None:
+            compressor_kwargs["mode"] = mode
+        compressor = brotli_mod.Compressor(**compressor_kwargs)
+
+        with src.open("rb") as f_in, tmp.open("wb") as f_out:
+            while True:
+                chunk = f_in.read(256 * 1024)
+                if not chunk:
+                    break
+                out = compressor.process(chunk)
+                if out:
+                    f_out.write(out)
+            tail = compressor.finish()
+            if tail:
+                f_out.write(tail)
+    elif brotli_kind == "cli":
+        exe = brotli_impl
+        # -f: overwrite, -q: quality, --lgwin: window size
+        subprocess.run(
+            [exe, "-f", "-q", str(quality), "--lgwin", str(lgwin), "-o", str(tmp), str(src)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        return False
+
+    try:
+        tmp_size = tmp.stat().st_size
+    except FileNotFoundError:
+        return False
+
+    if tmp_size <= 0:
+        tmp.unlink(missing_ok=True)
+        return False
+
+    # Only keep if it actually shrinks meaningfully.
+    if tmp_size >= int(src_stat.st_size * (1.0 - min_savings_ratio)):
+        tmp.unlink(missing_ok=True)
+        return False
+
+    tmp.replace(dst)
+    try:
+        os.utime(dst, (src_stat.st_atime, src_stat.st_mtime))
+    except Exception:
+        pass
+    return True
+
+
+def brotli_precompress_site(
+    site_root: Path,
+    *,
+    include_messages: bool,
+    quality: int,
+    lgwin: int,
+) -> int:
+    brotli_kind, brotli_impl = _detect_brotli()
+    if not brotli_kind:
+        return 0
+
+    roots = [site_root / "assets", site_root / "pagefind", site_root / "view"]
+    if include_messages:
+        roots.append(site_root / "messages")
+
+    wrote = 0
+    seen = set()
+    # Only consider files directly under site/ at the top level (e.g., site/index.html).
+    if site_root.exists():
+        for path in sorted(site_root.iterdir()):
+            if not path.is_file():
+                continue
+            if not _should_brotli_path(path):
+                continue
+            seen.add(path)
+            try:
+                if _maybe_write_brotli_file(path, quality, lgwin, brotli_kind, brotli_impl):
+                    wrote += 1
+            except Exception:
+                continue
+
+    for root in roots:
+        if not root.exists():
+            continue
+        if root.is_file():
+            candidates = [root]
+        else:
+            candidates = sorted(root.rglob("*"))
+        for path in candidates:
+            if not _should_brotli_path(path):
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                if _maybe_write_brotli_file(path, quality, lgwin, brotli_kind, brotli_impl):
+                    wrote += 1
+            except Exception:
+                # Compression should never break the build output.
+                continue
+
+    return wrote
+
+
+def main(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build the static offline chat search site.")
+    parser.add_argument(
+        "--brotli-only",
+        action="store_true",
+        help="Only generate .br files for existing site/ output (no page regeneration).",
+    )
+    parser.add_argument(
+        "--no-brotli",
+        action="store_true",
+        help="Disable Brotli precompression even if Brotli is available.",
+    )
+    parser.add_argument(
+        "--brotli-all",
+        action="store_true",
+        help="Also Brotli-compress site/messages/ (usually unnecessary and slower).",
+    )
+    parser.add_argument(
+        "--brotli-quality",
+        type=int,
+        default=int(os.environ.get("BROTLI_QUALITY", "5")),
+        help="Brotli quality (0-11). Default: 5 or $BROTLI_QUALITY.",
+    )
+    parser.add_argument(
+        "--brotli-lgwin",
+        type=int,
+        default=int(os.environ.get("BROTLI_LGWIN", "22")),
+        help="Brotli window size (10-24). Default: 22 or $BROTLI_LGWIN.",
+    )
+
+    args = parser.parse_args(argv)
+
     site_root = Path("site")
     site_root.mkdir(exist_ok=True)
 
-    conversations = []
-    chatgpt_path = Path("conversations.json")
-    if chatgpt_path.exists():
-        conversations.extend(load_chatgpt(chatgpt_path))
-    claude_path = Path("conversations-claude.json")
-    if claude_path.exists():
-        conversations.extend(load_claude(claude_path))
+    if not args.brotli_only:
+        conversations = []
+        chatgpt_path = Path("conversations.json")
+        if chatgpt_path.exists():
+            conversations.extend(load_chatgpt(chatgpt_path))
+        claude_path = Path("conversations-claude.json")
+        if claude_path.exists():
+            conversations.extend(load_claude(claude_path))
 
-    conversation_pages, message_pages = write_pages(conversations, site_root)
-    print(f"Wrote {conversation_pages} conversation pages under site/view")
-    print(f"Wrote {message_pages} message pages under site/messages")
+        conversation_pages, message_pages = write_pages(conversations, site_root)
+        print(f"Wrote {conversation_pages} conversation pages under site/view")
+        print(f"Wrote {message_pages} message pages under site/messages")
+
+    if not args.no_brotli:
+        brotli_kind, _ = _detect_brotli()
+        wrote = brotli_precompress_site(
+            site_root,
+            include_messages=bool(args.brotli_all),
+            quality=max(0, min(11, int(args.brotli_quality))),
+            lgwin=max(10, min(24, int(args.brotli_lgwin))),
+        )
+        if wrote:
+            print(f"Wrote {wrote} Brotli .br files under site/")
+        elif args.brotli_only and not brotli_kind:
+            print("Brotli not available; no .br files written")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

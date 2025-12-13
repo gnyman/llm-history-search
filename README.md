@@ -28,12 +28,17 @@ Search results link to the conversation view and focus the matching message.
 
 `bin/pagefind --site site --output-path site/pagefind --force-language en`
 
-3) Open `site/index.html` (or serve `site/` with any static file server).
+3) (Optional) Precompress with Brotli (writes `.br` files if Brotli is available, note, these won't be served over plain http):
+
+`python3 build_site.py --brotli-only`
+
+(note2: you can also use `--brotli-all` to compress conversations also)
+
+4) Open `site/index.html` (or serve `site/` with any static file server).
 
 ## Inputs (sensitive)
 
 - `conversations.json` (ChatGPT export)
 - `conversations-claude.json` (Claude export)
 
-These (and all generated output) are gitignored on purpose.
-
+These (and all generated output) are gitignored on purpose, unless you like splurging your personal data all over the internet you should not include them in your git repo.
