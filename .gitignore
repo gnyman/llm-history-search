@@ -1,0 +1,18 @@
+# Sensitive exports
+conversations.json
+conversations-claude.json
+
+# Generated static site + search index
+site/
+
+# Local vendored JS (not sensitive, but generated/downloaded)
+vendor/
+
+# Local toolchains/binaries
+.cargo/
+.rustup/
+bin/
+
+# Misc
+.DS_Store
+data/
