@@ -6,7 +6,7 @@ It is designed to work offline, because the best place for private conversations
 
 ## What it builds
 
-- `site/index.html`: a simple search UI.
+- `site/index.html`: a search UI (Classless.css).
 - `site/view/...`: one HTML page per conversation, rendered like a chat transcript.
 - `site/messages/...`: one HTML page per message (used for Pagefind indexing and ranking).
 - `site/pagefind/`: the search index and WASM/JS assets produced by Pagefind.

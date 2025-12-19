@@ -74,36 +74,31 @@ def render_markdown(text: str) -> str:
 
 
 CHAT_CSS = """
-body { font-family: system-ui, -apple-system, sans-serif; background: #f5f6f8; margin: 0; padding: 0; }
-.shell { max-width: 980px; margin: 0 auto; padding: 22px 16px 64px; }
-.topbar { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
-.topbar h1 { font-size: 1.2rem; margin: 0; }
-.topbar a { color: #2457c5; text-decoration: none; }
-.topbar a:hover { text-decoration: underline; }
-.topmeta { font-size: 0.85rem; color: #566; display: flex; gap: 10px; flex-wrap: wrap; }
-.log { background: #fff; border: 1px solid #d8dbe0; border-radius: 14px; padding: 12px 12px 2px; box-shadow: 0 4px 18px rgba(0,0,0,0.04); }
-.msg { margin: 10px 0; display: flex; flex-direction: column; }
-.meta-line { font-size: 0.82rem; color: #566; display: flex; gap: 8px; align-items: center; margin: 0 2px 4px; }
-.meta-line .time { margin-left: auto; color: #778; }
-.msg .bubble { max-width: 80%; padding: 12px 14px; border-radius: 12px; line-height: 1.5; background: #eef2f7; border: 1px solid #d8dbe0; overflow-wrap: anywhere; }
-.msg.left .bubble { background: #f7f9fc; margin-right: auto; }
-.msg.right { align-items: flex-end; }
-.msg.right .bubble { background: #e3f2ff; border-color: #b7d7ff; margin-left: auto; }
-.msg:target .bubble { outline: 3px solid #5b9bff; box-shadow: 0 0 0 2px #d7e7ff; }
-mark, mark.hit { background: #fff2a8; padding: 0 2px; border-radius: 3px; }
-code { font-family: SFMono-Regular, Consolas, 'Liberation Mono', monospace; background: #eef0f3; padding: 0 3px; border-radius: 4px; }
-pre { background: #0f141a; color: #e7edf5; padding: 12px; border-radius: 10px; overflow-x: auto; }
-pre code { background: transparent; color: inherit; padding: 0; }
+/* Chat-specific layout on top of a classless framework */
 
-/* Search page */
-.search-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-.search-row input[type="search"] { flex: 1; min-width: 280px; padding: 10px 12px; font-size: 1rem; border: 1px solid #d8dbe0; border-radius: 10px; }
-.results .result { padding: 10px 6px; border-bottom: 1px solid #eef0f3; }
-.results .result:last-child { border-bottom: none; }
-.results .result a { color: #2457c5; text-decoration: none; }
-.results .result a:hover { text-decoration: underline; }
-.results .meta { margin-top: 4px; font-size: 0.85rem; color: #566; }
-.results .bubble { max-width: 100%; margin-top: 8px; }
+.msg { margin: 1rem 0; display: flex; flex-direction: column; }
+.meta-line { font-size: 0.9rem; opacity: 0.8; display: flex; gap: 0.6rem; align-items: baseline; }
+.meta-line .time { margin-left: auto; white-space: nowrap; }
+
+.msg .bubble {
+  max-width: 80ch;
+  padding: 0.75rem 0.9rem;
+  border-radius: 0.8rem;
+  overflow-wrap: anywhere;
+  background: rgba(127, 127, 127, 0.08);
+  border: 1px solid rgba(127, 127, 127, 0.22);
+}
+.msg.right { align-items: flex-end; }
+.msg.right .bubble { background: rgba(25, 118, 210, 0.10); border-color: rgba(25, 118, 210, 0.25); }
+.msg:target .bubble { outline: 2px solid rgba(25, 118, 210, 0.8); }
+
+mark.hit { padding: 0 0.15em; border-radius: 0.2em; }
+
+.results { margin-top: 1rem; }
+.results article { padding: 0.75rem 0; border-bottom: 1px solid rgba(127, 127, 127, 0.20); }
+.results article:last-child { border-bottom: none; }
+.results .meta { opacity: 0.75; margin-top: 0.25rem; }
+.results .bubble { margin-top: 0.5rem; max-width: none; }
 """
 
 
@@ -112,22 +107,24 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <title>Chat Search</title>
+  <link rel="stylesheet" href="./assets/framework.css">
   <link rel="stylesheet" href="./assets/chat.css">
   <script src="./assets/marked.min.js"></script>
 </head>
-<body>
-  <div class="shell">
-    <div class="topbar">
-      <h1>Chat Search</h1>
-    </div>
-    <div class="topmeta">
-      <span>Searches individual messages (ChatGPT + Claude)</span>
-    </div>
-    <div class="search-row">
+<body data-pagefind-ignore="all">
+  <header>
+    <h1>Chat Search</h1>
+    <p>Searches individual messages (ChatGPT + Claude)</p>
+  </header>
+
+  <main>
+    <label>
+      Search
       <input id="search" type="search" placeholder="Search messages..." autofocus />
-    </div>
-    <div class="log results" id="results"></div>
-  </div>
+    </label>
+    <section class="results" id="results"></section>
+  </main>
+
   <script type="module">
     import { init, options, search as pagefindSearch } from './pagefind/pagefind.js';
 
@@ -160,9 +157,9 @@ INDEX_HTML = r"""<!doctype html>
       const makeUrlWithQuery = (url) => {
         const parts = String(url).split('#');
         const base = parts[0];
-        const hash = parts[1] ? `#${parts[1]}` : '';
+        const hash = parts[1] ? ('#' + parts[1]) : '';
         const joiner = base.includes('?') ? '&' : '?';
-        return `${base}${joiner}q=${encodeURIComponent(term)}${hash}`;
+        return base + joiner + 'q=' + encodeURIComponent(term) + hash;
       };
 
       const formatTs = (iso) => {
@@ -174,28 +171,61 @@ INDEX_HTML = r"""<!doctype html>
 
       const limit = 30;
 
+      const deriveTargetFromUrl = (url) => {
+        const raw = String(url || '');
+        const noQuery = raw.split('?')[0];
+        const path = noQuery.replace(/^\.\//, '').replace(/^\/+/, '');
+        const m = path.match(/(?:^|\/)messages\/([^/]+)\/([^/]+)\/([^/]+?)(?:\.html)?$/);
+        if (!m) return null;
+        return {
+          source: m[1] || '',
+          convSafe: m[2] || '',
+          msgSafe: m[3] || '',
+        };
+      };
+
       for (const [idx, r] of res.results.slice(0, limit).entries()) {
         if (searchId !== activeSearchId) return;
         const data = await r.data();
         if (searchId !== activeSearchId) return;
         const meta = data.meta || {};
-        const href = meta.target_url || data.url;
+        const source =
+          meta.source ||
+          (deriveTargetFromUrl(data.url) ? deriveTargetFromUrl(data.url).source : '') ||
+          '';
+        const convSafe =
+          meta['conversation-id-safe'] ||
+          meta.conversation_id_safe ||
+          (deriveTargetFromUrl(data.url) ? deriveTargetFromUrl(data.url).convSafe : '') ||
+          '';
+        const msgSafe =
+          meta['message-id-safe'] ||
+          meta.message_id_safe ||
+          (deriveTargetFromUrl(data.url) ? deriveTargetFromUrl(data.url).msgSafe : '') ||
+          '';
+
+        const href =
+          './view/' +
+          encodeURIComponent(source) +
+          '/' +
+          encodeURIComponent(convSafe) +
+          '.html#msg-' +
+          encodeURIComponent(msgSafe);
         const finalHref = makeUrlWithQuery(href);
 
-        const el = document.createElement('div');
-        el.className = 'result';
+        const el = document.createElement('article');
 
         const link = document.createElement('a');
         link.href = finalHref;
-        link.textContent = meta.title || data.url;
+        link.textContent = meta.title || 'Result';
         el.appendChild(link);
 
         const metaLine = document.createElement('div');
         metaLine.className = 'meta';
         const bits = [];
-        if (meta.source) bits.push(`source: ${meta.source}`);
-        if (meta.author) bits.push(`author: ${meta.author}`);
-        if (meta.timestamp) bits.push(`time: ${formatTs(meta.timestamp)}`);
+        if (meta.source) bits.push('source: ' + meta.source);
+        if (meta.author) bits.push('author: ' + meta.author);
+        if (meta.timestamp) bits.push('time: ' + formatTs(meta.timestamp));
         metaLine.textContent = bits.join(' · ');
         el.appendChild(metaLine);
 
@@ -406,45 +436,53 @@ def load_claude(path: Path):
     return conversations
 
 
-def write_pages(conversations, site_root: Path):
+def write_pages(conversations, site_root: Path) -> tuple[int, int]:
     assets_dir = site_root / "assets"
-    assets_dir.mkdir(parents=True, exist_ok=True)
-    (assets_dir / "chat.css").write_text(CHAT_CSS.strip() + "\n", encoding="utf-8")
-    marked_src = Path("vendor/marked.min.js")
-    if marked_src.exists():
-        shutil.copyfile(marked_src, assets_dir / "marked.min.js")
-    (site_root / "index.html").write_text(INDEX_HTML, encoding="utf-8")
-
     view_root = site_root / "view"
     msg_root = site_root / "messages"
-    for p in (view_root, msg_root):
+
+    # Clear legacy outputs
+    for legacy in (site_root / "simple", site_root / "classless"):
+        if legacy.exists():
+            shutil.rmtree(legacy)
+
+    for p in (assets_dir, view_root, msg_root):
         if p.exists():
             shutil.rmtree(p)
         p.mkdir(parents=True, exist_ok=True)
+
+    (assets_dir / "chat.css").write_text(CHAT_CSS.strip() + "\n", encoding="utf-8")
+    shutil.copyfile(Path("classless.css"), assets_dir / "framework.css")
+    marked_src = Path("vendor/marked.min.js")
+    if marked_src.exists():
+        shutil.copyfile(marked_src, assets_dir / "marked.min.js")
+
+    (site_root / "index.html").write_text(INDEX_HTML, encoding="utf-8")
 
     message_pages = 0
     conversation_pages = 0
 
     for conv in conversations:
         conv_id_safe = sanitize_component(conv["id"])
+
         view_path = view_root / conv["source"] / f"{conv_id_safe}.html"
         view_path.parent.mkdir(parents=True, exist_ok=True)
-        view_css_href = rel_href(view_path, assets_dir / "chat.css")
-        view_path.write_text(render_conversation_view(conv, view_css_href), encoding="utf-8")
+        framework_href = rel_href(view_path, assets_dir / "framework.css")
+        chat_href = rel_href(view_path, assets_dir / "chat.css")
+        view_path.write_text(render_conversation_view(conv, framework_href, chat_href), encoding="utf-8")
         conversation_pages += 1
 
         for msg in conv["messages"]:
             msg_id_safe = sanitize_component(msg["id"])
             msg_path = msg_root / conv["source"] / conv_id_safe / f"{msg_id_safe}.html"
             msg_path.parent.mkdir(parents=True, exist_ok=True)
-            target_url = rel_href(msg_path, view_path) + f"#msg-{msg_id_safe}"
-            msg_path.write_text(render_message_index_page(conv, msg, target_url), encoding="utf-8")
+            msg_path.write_text(render_message_index_page(conv, msg, conv_id_safe, msg_id_safe), encoding="utf-8")
             message_pages += 1
 
     return conversation_pages, message_pages
 
 
-def render_conversation_view(conv: dict, css_href: str) -> str:
+def render_conversation_view(conv: dict, framework_css_href: str, chat_css_href: str) -> str:
     def render_bubble(m):
         side = "right" if m["author"] in ("user", "human") else "left"
         role_label = "You" if m["author"] in ("user", "human") else m["author"]
@@ -464,37 +502,37 @@ def render_conversation_view(conv: dict, css_href: str) -> str:
 <head>
   <meta charset="utf-8">
   <title>{escape(conv["title"])}</title>
-  <link rel="stylesheet" href="{escape(css_href)}">
+  <link rel="stylesheet" href="{escape(framework_css_href)}">
+  <link rel="stylesheet" href="{escape(chat_css_href)}">
 </head>
-<body>
-  <div class="shell">
-    <div class="topbar">
-      <h1>{escape(conv["title"])}</h1>
-      <a href="../../index.html">Search</a>
-    </div>
-    <div class="topmeta">
-      <span>Source: {escape(conv["source"])}</span>
-      <span>Conversation: {escape(conv["id"])}</span>
-      <span>Created: <span class="time" data-iso="{escape(conv.get("timestamp",""))}">{escape(conv.get("timestamp",""))}</span></span>
-    </div>
-    <div class="log">
-      {conversation_html}
-    </div>
-  </div>
+<body data-pagefind-ignore="all">
+  <header>
+    <h1>{escape(conv["title"])}</h1>
+    <nav><a href="../../index.html">Search</a></nav>
+    <p>
+      Source: {escape(conv["source"])} · Conversation: {escape(conv["id"])} · Created:
+      <span class="time" data-iso="{escape(conv.get("timestamp",""))}">{escape(conv.get("timestamp",""))}</span>
+    </p>
+  </header>
+
+  <main>
+    {conversation_html}
+  </main>
   {CONVERSATION_SCRIPT}
 </body>
 </html>
 """
 
 
-def render_message_index_page(conv: dict, msg: dict, target_url: str) -> str:
+def render_message_index_page(conv: dict, msg: dict, conv_id_safe: str, msg_id_safe: str) -> str:
     target_meta = {
         "title": conv["title"],
         "source": conv["source"],
-        "conversation_id": conv["id"],
+        "conversation-id": conv["id"],
+        "conversation-id-safe": conv_id_safe,
         "author": msg["author"],
         "timestamp": msg.get("timestamp", ""),
-        "target_url": target_url,
+        "message-id-safe": msg_id_safe,
     }
     meta_tags = "\n  ".join(
         f'<div data-pagefind-meta="{k}">{escape(str(v))}</div>' for k, v in target_meta.items()
@@ -506,7 +544,7 @@ def render_message_index_page(conv: dict, msg: dict, target_url: str) -> str:
   <title>{escape(conv["title"])} - {escape(msg["id"])}</title>
 </head>
 <body>
-  <div style="display:none">
+  <div hidden>
   {meta_tags}
   </div>
   <article data-pagefind-body>
