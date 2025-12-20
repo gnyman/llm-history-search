@@ -1,12 +1,23 @@
 import json
 import os
 import re
+import secrets
 import shutil
+import struct
 import subprocess
 import sys
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.backends import default_backend
+    ENCRYPTION_AVAILABLE = True
+except ImportError:
+    ENCRYPTION_AVAILABLE = False
 
 
 def sanitize_component(value: str) -> str:
@@ -73,6 +84,63 @@ def render_markdown(text: str) -> str:
     return "".join(out) if out else f"<p>{escape(text)}</p>"
 
 
+def derive_encryption_key(password: str, salt: bytes, iterations: int) -> bytes:
+    """Derive 256-bit encryption key using PBKDF2-HMAC-SHA256."""
+    if not ENCRYPTION_AVAILABLE:
+        raise RuntimeError("Encryption requires 'cryptography' library. Install with: pip install cryptography")
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,  # 256 bits
+        salt=salt,
+        iterations=iterations,
+        backend=default_backend()
+    )
+    return kdf.derive(password.encode('utf-8'))
+
+
+def encrypt_content(plaintext: bytes, key_bytes: bytes, salt: bytes, iterations: int) -> bytes:
+    """
+    Encrypt content using AES-256-GCM with pre-derived key.
+    Returns encrypted data in Pagefind-compatible format:
+    [12 bytes: "pagefind_e2c" magic]
+    [1 byte: salt length]
+    [4 bytes: iterations, big-endian]
+    [N bytes: salt]
+    [12 bytes: nonce]
+    [remaining: AES-256-GCM ciphertext]
+
+    Args:
+        plaintext: Data to encrypt
+        key_bytes: Pre-derived 256-bit key (use derive_encryption_key)
+        salt: Salt used for key derivation (stored in output)
+        iterations: Iterations used for key derivation (stored in output)
+    """
+    if not ENCRYPTION_AVAILABLE:
+        raise RuntimeError("Encryption requires 'cryptography' library. Install with: pip install cryptography")
+
+    if len(salt) > 255:
+        raise ValueError("Salt length must be <= 255 bytes")
+
+    # Generate random 12-byte nonce for AES-GCM
+    nonce = secrets.token_bytes(12)
+
+    # Encrypt with AES-256-GCM
+    cipher = AESGCM(key_bytes)
+    ciphertext = cipher.encrypt(nonce, plaintext, None)
+
+    # Build encrypted format
+    result = bytearray()
+    result.extend(b"pagefind_e2c")  # Magic (12 bytes)
+    result.append(len(salt))  # Salt length (1 byte)
+    result.extend(struct.pack('>I', iterations))  # Iterations, big-endian (4 bytes)
+    result.extend(salt)  # Salt (N bytes)
+    result.extend(nonce)  # Nonce (12 bytes)
+    result.extend(ciphertext)  # Ciphertext
+
+    return bytes(result)
+
+
 CHAT_CSS = """
 /* Chat-specific layout on top of a classless framework */
 
@@ -110,6 +178,25 @@ INDEX_HTML = r"""<!doctype html>
   <link rel="stylesheet" href="./assets/framework.css">
   <link rel="stylesheet" href="./assets/chat.css">
   <script src="./assets/marked.min.js"></script>
+  <style>
+    dialog {
+      border: 1px solid rgba(127, 127, 127, 0.3);
+      border-radius: 0.5rem;
+      padding: 1.5rem;
+      max-width: 400px;
+    }
+    dialog::backdrop {
+      background: rgba(0, 0, 0, 0.5);
+    }
+    #key-error {
+      color: #c00;
+      margin-top: 0.5rem;
+      display: none;
+    }
+    #key-error.show {
+      display: block;
+    }
+  </style>
 </head>
 <body data-pagefind-ignore="all">
   <header>
@@ -125,20 +212,100 @@ INDEX_HTML = r"""<!doctype html>
     <section class="results" id="results"></section>
   </main>
 
+  <dialog id="key-prompt">
+    <h2>Enter Encryption Key</h2>
+    <p>This search index is encrypted. Please enter your decryption key:</p>
+    <form method="dialog">
+      <label>
+        Encryption Key
+        <input type="password" id="key-input" required autocomplete="off" />
+      </label>
+      <div id="key-error"></div>
+      <button type="submit" id="key-submit">Unlock</button>
+    </form>
+  </dialog>
+
   <script type="module">
-    import { init, options, search as pagefindSearch } from './pagefind/pagefind.js';
+    import { init, options, search as pagefindSearch, preload } from './pagefind/pagefind.js';
 
     const searchInput = document.getElementById('search');
     const resultsEl = document.getElementById('results');
+    const keyPromptDialog = document.getElementById('key-prompt');
+    const keyInput = document.getElementById('key-input');
+    const keyError = document.getElementById('key-error');
+    const keySubmitBtn = document.getElementById('key-submit');
 
     let pagefindReady = null;
     let activeSearchId = 0;
     let debounceTimer = null;
+    const isEncrypted = {is_encrypted};
+
+    async function getEncryptionKey() {
+      // Check localStorage first
+      const stored = localStorage.getItem('chat-search-encryption-key');
+      if (stored) {
+        return stored;
+      }
+
+      // Prompt user for key
+      return await promptUserForKey();
+    }
+
+    async function promptUserForKey() {
+      keyPromptDialog.showModal();
+      keyError.textContent = '';
+      keyError.classList.remove('show');
+      keyInput.value = '';
+
+      return new Promise((resolve) => {
+        const handleSubmit = async (e) => {
+          e.preventDefault();
+          const key = keyInput.value.trim();
+          if (!key) return;
+
+          keySubmitBtn.disabled = true;
+          keySubmitBtn.textContent = 'Validating...';
+
+          try {
+            // Validate key by attempting to initialize Pagefind
+            await options({
+              encryptionKey: key
+            });
+            await init();
+            await preload('');
+
+            // Success! Store key and close dialog
+            localStorage.setItem('chat-search-encryption-key', key);
+            keyPromptDialog.close();
+            keyPromptDialog.removeEventListener('submit', handleSubmit);
+            resolve(key);
+          } catch (err) {
+            // Wrong key or other error
+            keyError.textContent = 'Incorrect key or decryption failed. Please try again.';
+            keyError.classList.add('show');
+            keySubmitBtn.disabled = false;
+            keySubmitBtn.textContent = 'Unlock';
+            keyInput.select();
+          }
+        };
+
+        keyPromptDialog.addEventListener('submit', handleSubmit);
+      });
+    }
+
     async function ensureReady() {
       if (!pagefindReady) {
         pagefindReady = (async () => {
-          await options({ basePath: './pagefind/' });
-          await init();
+          if (isEncrypted) {
+            const key = await getEncryptionKey();
+            await options({
+              encryptionKey: key
+            });
+            await init();
+            await preload('');
+          } else {
+            await init();
+          }
         })();
       }
       await pagefindReady;
@@ -204,13 +371,17 @@ INDEX_HTML = r"""<!doctype html>
           (deriveTargetFromUrl(data.url) ? deriveTargetFromUrl(data.url).msgSafe : '') ||
           '';
 
-        const href =
-          './view/' +
-          encodeURIComponent(source) +
-          '/' +
-          encodeURIComponent(convSafe) +
-          '.html#msg-' +
-          encodeURIComponent(msgSafe);
+        // Build URL: use view-loader if encrypted, direct HTML if not
+        let href;
+        if (isEncrypted) {
+          href = './view-loader.html?source=' + encodeURIComponent(source) +
+                 '&conv=' + encodeURIComponent(convSafe) +
+                 '#msg-' + encodeURIComponent(msgSafe);
+        } else {
+          href = './view/' + encodeURIComponent(source) + '/' +
+                 encodeURIComponent(convSafe) + '.html#msg-' +
+                 encodeURIComponent(msgSafe);
+        }
         const finalHref = makeUrlWithQuery(href);
 
         const el = document.createElement('article');
@@ -260,6 +431,105 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     searchInput.addEventListener('input', scheduleSearch);
+
+    // Prompt for key immediately on page load
+    ensureReady();
+  </script>
+</body>
+</html>
+"""
+
+VIEW_LOADER_HTML = r"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Loading Conversation...</title>
+  <style>
+    body {
+      margin: 2rem;
+      font-family: system-ui, sans-serif;
+    }
+    .loading {
+      text-align: center;
+      padding: 3rem;
+    }
+    .error {
+      color: #c00;
+      padding: 2rem;
+      border: 1px solid #c00;
+      border-radius: 0.5rem;
+      background: #fee;
+    }
+  </style>
+</head>
+<body>
+  <div class="loading" id="loading">
+    <p>Decrypting conversation...</p>
+  </div>
+  <div class="error" id="error" style="display: none;"></div>
+
+  <script type="module">
+    import { ChatCrypto } from './assets/crypto.js';
+
+    async function loadEncryptedConversation() {
+      const loadingEl = document.getElementById('loading');
+      const errorEl = document.getElementById('error');
+
+      try {
+        // Parse URL parameters
+        const params = new URLSearchParams(location.search);
+        const source = params.get('source');
+        const conv = params.get('conv');
+        const hash = location.hash || '';
+
+        if (!source || !conv) {
+          throw new Error('Missing source or conversation ID in URL');
+        }
+
+        // Get encryption key from localStorage
+        const key = localStorage.getItem('chat-search-encryption-key');
+        if (!key) {
+          // Redirect to index to prompt for key
+          const returnUrl = encodeURIComponent(location.pathname + location.search + hash);
+          window.location.href = './index.html?return=' + returnUrl;
+          return;
+        }
+
+        // Fetch encrypted conversation file
+        const url = `./view/${source}/${conv}.enc.html`;
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`Failed to load conversation: ${response.status} ${response.statusText}`);
+        }
+
+        const encryptedData = new Uint8Array(await response.arrayBuffer());
+
+        // Decrypt using ChatCrypto
+        const crypto = new ChatCrypto(key);
+        const decryptedHtml = await crypto.decryptText(encryptedData);
+
+        // Replace current document with decrypted HTML
+        document.open();
+        document.write(decryptedHtml);
+        document.close();
+
+        // Restore hash if present (for message highlighting)
+        if (hash) {
+          location.hash = hash;
+        }
+      } catch (err) {
+        loadingEl.style.display = 'none';
+        errorEl.style.display = 'block';
+        errorEl.innerHTML = `
+          <h2>Error Loading Conversation</h2>
+          <p>${err.message}</p>
+          <p><a href="./index.html">Return to Search</a></p>
+        `;
+        console.error('Decryption error:', err);
+      }
+    }
+
+    loadEncryptedConversation();
   </script>
 </body>
 </html>
@@ -436,41 +706,17 @@ def load_claude(path: Path):
     return conversations
 
 
-def write_pages(conversations, site_root: Path) -> tuple[int, int]:
-    assets_dir = site_root / "assets"
-    view_root = site_root / "view"
+def write_message_index_pages(conversations, site_root: Path) -> int:
+    """Write message index pages for Pagefind (always unencrypted)."""
     msg_root = site_root / "messages"
-
-    # Clear legacy outputs
-    for legacy in (site_root / "simple", site_root / "classless"):
-        if legacy.exists():
-            shutil.rmtree(legacy)
-
-    for p in (assets_dir, view_root, msg_root):
-        if p.exists():
-            shutil.rmtree(p)
-        p.mkdir(parents=True, exist_ok=True)
-
-    (assets_dir / "chat.css").write_text(CHAT_CSS.strip() + "\n", encoding="utf-8")
-    shutil.copyfile(Path("classless.css"), assets_dir / "framework.css")
-    marked_src = Path("vendor/marked.min.js")
-    if marked_src.exists():
-        shutil.copyfile(marked_src, assets_dir / "marked.min.js")
-
-    (site_root / "index.html").write_text(INDEX_HTML, encoding="utf-8")
+    msg_root.mkdir(parents=True, exist_ok=True)
 
     message_pages = 0
-    conversation_pages = 0
+    total_messages = sum(len(conv["messages"]) for conv in conversations)
 
+    print(f"Generating message index pages for Pagefind...")
     for conv in conversations:
         conv_id_safe = sanitize_component(conv["id"])
-
-        view_path = view_root / conv["source"] / f"{conv_id_safe}.html"
-        view_path.parent.mkdir(parents=True, exist_ok=True)
-        framework_href = rel_href(view_path, assets_dir / "framework.css")
-        chat_href = rel_href(view_path, assets_dir / "chat.css")
-        view_path.write_text(render_conversation_view(conv, framework_href, chat_href), encoding="utf-8")
-        conversation_pages += 1
 
         for msg in conv["messages"]:
             msg_id_safe = sanitize_component(msg["id"])
@@ -479,7 +725,83 @@ def write_pages(conversations, site_root: Path) -> tuple[int, int]:
             msg_path.write_text(render_message_index_page(conv, msg, conv_id_safe, msg_id_safe), encoding="utf-8")
             message_pages += 1
 
-    return conversation_pages, message_pages
+            if message_pages % 1000 == 0:
+                print(f"\r  [{message_pages}/{total_messages}] message pages written...", end='', flush=True)
+
+    print()  # Final newline after progress updates
+    return message_pages
+
+
+def write_conversation_pages(conversations, site_root: Path, encryption_key: str = None, encryption_salt: bytes = None, encryption_iterations: int = 100000) -> int:
+    """Write conversation view pages (encrypted if key provided)."""
+    assets_dir = site_root / "assets"
+    view_root = site_root / "view"
+    view_root.mkdir(parents=True, exist_ok=True)
+
+    conversation_pages = 0
+    total_conversations = len(conversations)
+
+    # Derive encryption key once if encrypting (expensive PBKDF2 operation)
+    derived_key = None
+    if encryption_key:
+        print(f"Deriving encryption key (PBKDF2 with {encryption_iterations:,} iterations)...")
+        derived_key = derive_encryption_key(encryption_key, encryption_salt, encryption_iterations)
+        print(f"Generating encrypted conversation pages...")
+    else:
+        print(f"Generating conversation pages...")
+
+    for idx, conv in enumerate(conversations, 1):
+        conv_id_safe = sanitize_component(conv["id"])
+
+        # Generate conversation view HTML
+        framework_href = rel_href(view_root / conv["source"] / f"{conv_id_safe}.html", assets_dir / "framework.css")
+        chat_href = rel_href(view_root / conv["source"] / f"{conv_id_safe}.html", assets_dir / "chat.css")
+        conversation_html = render_conversation_view(conv, framework_href, chat_href)
+
+        # Write conversation view (encrypted if key provided)
+        if encryption_key:
+            view_path = view_root / conv["source"] / f"{conv_id_safe}.enc.html"
+            view_path.parent.mkdir(parents=True, exist_ok=True)
+            encrypted_data = encrypt_content(
+                conversation_html.encode('utf-8'),
+                derived_key,  # Use pre-derived key (fast)
+                encryption_salt,
+                encryption_iterations
+            )
+            view_path.write_bytes(encrypted_data)
+        else:
+            view_path = view_root / conv["source"] / f"{conv_id_safe}.html"
+            view_path.parent.mkdir(parents=True, exist_ok=True)
+            view_path.write_text(conversation_html, encoding="utf-8")
+        conversation_pages += 1
+
+        if conversation_pages % 500 == 0:
+            print(f"\r  [{conversation_pages}/{total_conversations}] conversation pages written...", end='', flush=True)
+
+    print()  # Final newline after progress updates
+    return conversation_pages
+
+
+def setup_assets(site_root: Path, encryption_enabled: bool = False):
+    """Set up assets directory with CSS, JS, and templates."""
+    assets_dir = site_root / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    (assets_dir / "chat.css").write_text(CHAT_CSS.strip() + "\n", encoding="utf-8")
+    shutil.copyfile(Path("classless.css"), assets_dir / "framework.css")
+    marked_src = Path("vendor/marked.min.js")
+    if marked_src.exists():
+        shutil.copyfile(marked_src, assets_dir / "marked.min.js")
+
+    # Copy crypto.js for client-side decryption
+    crypto_src = Path("crypto.js")
+    if crypto_src.exists():
+        shutil.copyfile(crypto_src, assets_dir / "crypto.js")
+
+    # Render index.html with encryption flag
+    index_html = INDEX_HTML.replace('{is_encrypted}', 'true' if encryption_enabled else 'false')
+    (site_root / "index.html").write_text(index_html, encoding="utf-8")
+    (site_root / "view-loader.html").write_text(VIEW_LOADER_HTML, encoding="utf-8")
 
 
 def render_conversation_view(conv: dict, framework_css_href: str, chat_css_href: str) -> str:
@@ -738,10 +1060,14 @@ def brotli_precompress_site(
             try:
                 if _maybe_write_brotli_file(path, quality, lgwin, brotli_kind, brotli_impl):
                     wrote += 1
+                    if wrote % 500 == 0:
+                        print(f"\r  Compressed {wrote} files...", end='', flush=True)
             except Exception:
                 # Compression should never break the build output.
                 continue
 
+    if wrote > 0:
+        print()  # Final newline after progress
     return wrote
 
 
@@ -776,13 +1102,68 @@ def main(argv=None):
         default=int(os.environ.get("BROTLI_LGWIN", "22")),
         help="Brotli window size (10-24). Default: 22 or $BROTLI_LGWIN.",
     )
+    parser.add_argument(
+        "--encryption-key",
+        type=str,
+        help="Encryption key for Pagefind index and conversation pages. Can also use ENCRYPTION_KEY env var.",
+    )
+    parser.add_argument(
+        "--encryption-iterations",
+        type=int,
+        default=100000,
+        help="PBKDF2 iterations for key derivation. Default: 100000.",
+    )
+    parser.add_argument(
+        "--encryption-salt",
+        type=str,
+        help="Hex-encoded salt for key derivation. If not provided, generates random 16-byte salt.",
+    )
+    parser.add_argument(
+        "--delete-without-asking",
+        action="store_true",
+        help="Delete site/ directory without prompting (default: ask first).",
+    )
 
     args = parser.parse_args(argv)
 
+    # Get encryption key (env var takes precedence)
+    encryption_key = os.environ.get("ENCRYPTION_KEY") or args.encryption_key
+    encryption_iterations = args.encryption_iterations
+
+    # Generate or parse salt
+    encryption_salt = None
+    if encryption_key:
+        if not ENCRYPTION_AVAILABLE:
+            print("ERROR: Encryption requested but 'cryptography' library not available.")
+            print("Install with: pip install cryptography")
+            sys.exit(1)
+
+        if args.encryption_salt:
+            try:
+                encryption_salt = bytes.fromhex(args.encryption_salt)
+            except ValueError:
+                print("ERROR: --encryption-salt must be a hex-encoded string")
+                sys.exit(1)
+        else:
+            encryption_salt = secrets.token_bytes(16)
+            print(f"Generated random salt: {encryption_salt.hex()}")
+
     site_root = Path("site")
-    site_root.mkdir(exist_ok=True)
 
     if not args.brotli_only:
+        # Clean slate: remove entire site directory
+        if site_root.exists():
+            if not args.delete_without_asking:
+                response = input(f"Delete existing {site_root}/ directory? [y/N]: ").strip().lower()
+                if response not in ('y', 'yes'):
+                    print("Aborted.")
+                    sys.exit(0)
+            shutil.rmtree(site_root)
+            print(f"Deleted {site_root}/")
+        site_root.mkdir(parents=True, exist_ok=True)
+
+        # Step 1: Load conversations
+        print("\n=== Step 1/5: Loading conversations ===")
         conversations = []
         chatgpt_path = Path("conversations.json")
         if chatgpt_path.exists():
@@ -790,13 +1171,99 @@ def main(argv=None):
         claude_path = Path("conversations-claude.json")
         if claude_path.exists():
             conversations.extend(load_claude(claude_path))
+        print(f"Loaded {len(conversations)} conversations")
 
-        conversation_pages, message_pages = write_pages(conversations, site_root)
-        print(f"Wrote {conversation_pages} conversation pages under site/view")
-        print(f"Wrote {message_pages} message pages under site/messages")
+        # Step 2: Set up assets and templates
+        print("\n=== Step 2/5: Setting up assets ===")
+        setup_assets(site_root, encryption_enabled=bool(encryption_key))
+        print("Assets and templates ready")
+
+        # Step 3: Generate message index pages (for Pagefind)
+        print("\n=== Step 3/5: Generating message index pages ===")
+        message_pages = write_message_index_pages(conversations, site_root)
+        print(f"Wrote {message_pages} message index pages")
+
+        # Step 4: Run Pagefind to build search index
+        print("\n=== Step 4/5: Building search index with Pagefind ===")
+        pagefind_bin = None
+        for candidate in [Path("pagefind"), Path("./pagefind"), Path("bin/pagefind")]:
+            if candidate.exists() and candidate.is_file():
+                pagefind_bin = candidate
+                break
+
+        if not pagefind_bin:
+            print("WARNING: pagefind binary not found, skipping index generation")
+        else:
+            # Use absolute path to ensure subprocess can find the binary
+            cmd = [
+                str(pagefind_bin.resolve()),
+                "--site", "site",
+                "--output-path", "site/pagefind",
+                "--force-language", "en"
+            ]
+            if encryption_key:
+                cmd.extend(["--encryption-key", encryption_key])
+                cmd.extend(["--encryption-iterations", str(encryption_iterations)])
+                if args.encryption_salt:
+                    cmd.extend(["--encryption-salt", args.encryption_salt])
+                else:
+                    cmd.extend(["--encryption-salt", encryption_salt.hex()])
+
+            print(f"Running: {pagefind_bin.name} --site site ...")
+            try:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                if result.stdout:
+                    print(result.stdout)
+                if encryption_key:
+                    print("Pagefind encrypted index generated successfully")
+                else:
+                    print("Pagefind index generated successfully")
+            except subprocess.CalledProcessError as e:
+                print(f"ERROR: Pagefind failed with exit code {e.returncode}")
+                if e.stderr:
+                    print(e.stderr)
+                sys.exit(1)
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                print(f"ERROR: Failed to run pagefind binary: {e}")
+                print(f"Binary location: {pagefind_bin.resolve()}")
+                print("\nIf on macOS and downloaded the binary, you may need to remove quarantine:")
+                print(f"  xattr -d com.apple.quarantine {pagefind_bin}")
+                sys.exit(1)
+
+            # Delete message index pages after Pagefind indexing (security cleanup)
+            if encryption_key:
+                print("\n=== Step 5/5: Security cleanup and generating encrypted conversations ===")
+                messages_dir = site_root / "messages"
+                if messages_dir.exists():
+                    shutil.rmtree(messages_dir)
+                    print("Deleted plaintext message index pages")
+            else:
+                print("\n=== Step 5/5: Generating conversation pages ===")
+
+        # Step 5: Generate conversation pages (encrypted if key provided)
+        conversation_pages = write_conversation_pages(
+            conversations,
+            site_root,
+            encryption_key=encryption_key,
+            encryption_salt=encryption_salt,
+            encryption_iterations=encryption_iterations
+        )
+        if encryption_key:
+            print(f"Wrote {conversation_pages} encrypted conversation pages")
+        else:
+            print(f"Wrote {conversation_pages} conversation pages")
+
+        print(f"\n✓ Build complete! Output in site/")
+    else:
+        # For brotli-only mode, site must already exist
+        if not site_root.exists():
+            print("ERROR: site/ directory not found (required for --brotli-only)")
+            sys.exit(1)
 
     if not args.no_brotli:
         brotli_kind, _ = _detect_brotli()
+        if brotli_kind:
+            print("\nCompressing with Brotli...")
         wrote = brotli_precompress_site(
             site_root,
             include_messages=bool(args.brotli_all),
@@ -804,7 +1271,7 @@ def main(argv=None):
             lgwin=max(10, min(24, int(args.brotli_lgwin))),
         )
         if wrote:
-            print(f"Wrote {wrote} Brotli .br files under site/")
+            print(f"Wrote {wrote} Brotli .br files")
         elif args.brotli_only and not brotli_kind:
             print("Brotli not available; no .br files written")
 
