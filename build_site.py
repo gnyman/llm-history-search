@@ -244,8 +244,8 @@ INDEX_HTML = r"""<!doctype html>
   </main>
 
   <dialog id="key-prompt">
-    <h2>Enter Encryption Key</h2>
-    <p>This search index is encrypted. Please enter your decryption key:</p>
+    <h2 id="key-prompt-title">Enter Encryption Key</h2>
+    <p id="key-prompt-message">This search index is encrypted. Please enter your decryption key:</p>
     <form method="dialog">
       <label>
         Encryption Key
@@ -278,6 +278,8 @@ INDEX_HTML = r"""<!doctype html>
     const searchInput = document.getElementById('search');
     const resultsEl = document.getElementById('results');
     const keyPromptDialog = document.getElementById('key-prompt');
+    const keyPromptTitle = document.getElementById('key-prompt-title');
+    const keyPromptMessage = document.getElementById('key-prompt-message');
     const keyInput = document.getElementById('key-input');
     const keyRemember = document.getElementById('key-remember');
     const keyError = document.getElementById('key-error');
@@ -289,6 +291,17 @@ INDEX_HTML = r"""<!doctype html>
     const isEncrypted = {is_encrypted};
 
     async function getEncryptionKey() {
+      // Check for error parameter in URL (redirected from view-loader)
+      const urlParams = new URLSearchParams(location.search);
+      if (urlParams.get('error') === 'key') {
+        // Clear error from URL
+        const cleanUrl = location.pathname + location.hash;
+        history.replaceState({}, '', cleanUrl);
+
+        // Prompt with error message
+        return await promptUserForKey('Stored encryption key is incorrect. Please enter the correct key.');
+      }
+
       // Check localStorage first (persistent)
       let stored = localStorage.getItem('chat-search-encryption-key');
       if (stored) return stored;
@@ -301,10 +314,21 @@ INDEX_HTML = r"""<!doctype html>
       return await promptUserForKey();
     }
 
-    async function promptUserForKey() {
+    async function promptUserForKey(errorMessage = '') {
       keyPromptDialog.showModal();
-      keyError.textContent = '';
-      keyError.classList.remove('show');
+
+      // Update dialog based on whether this is an error re-prompt or initial prompt
+      if (errorMessage) {
+        keyPromptTitle.textContent = 'Encryption Key Required';
+        keyPromptMessage.textContent = '';
+        keyError.textContent = errorMessage;
+        keyError.classList.add('show');
+      } else {
+        keyPromptTitle.textContent = 'Enter Encryption Key';
+        keyPromptMessage.textContent = 'This search index is encrypted. Please enter your decryption key:';
+        keyError.textContent = '';
+        keyError.classList.remove('show');
+      }
       keyInput.value = '';
 
       return new Promise((resolve) => {
@@ -354,11 +378,30 @@ INDEX_HTML = r"""<!doctype html>
         pagefindReady = (async () => {
           if (isEncrypted) {
             const key = await getEncryptionKey();
-            await options({
-              encryptionKey: key
-            });
-            await init();
-            await preload('');
+            try {
+              await options({
+                encryptionKey: key
+              });
+              await init();
+              await preload('');
+            } catch (err) {
+              // Stored key is wrong - clear it and re-prompt
+              localStorage.removeItem('chat-search-encryption-key');
+              sessionStorage.removeItem('chat-search-encryption-key');
+              pagefindReady = null; // Reset so we can retry
+
+              // Extract meaningful error from Pagefind error
+              const errorMsg = err.message?.includes('Decryption failed')
+                ? 'Stored encryption key is incorrect. Please enter the correct key.'
+                : 'Failed to load the search index. Please try again.';
+
+              const newKey = await promptUserForKey(errorMsg);
+              await options({
+                encryptionKey: newKey
+              });
+              await init();
+              await preload('');
+            }
           } else {
             await init();
           }
@@ -578,6 +621,21 @@ VIEW_LOADER_HTML = r"""<!doctype html>
           location.hash = hash;
         }
       } catch (err) {
+        console.error('Decryption error:', err);
+
+        // Check if this is a decryption failure (wrong key)
+        if (err.message && (err.message.includes('Decryption failed') || err.message.includes('wrong key'))) {
+          // Clear stored key
+          localStorage.removeItem('chat-search-encryption-key');
+          sessionStorage.removeItem('chat-search-encryption-key');
+
+          // Redirect to index with error message
+          const returnUrl = encodeURIComponent(location.pathname + location.search + hash);
+          window.location.href = './index.html?error=key&return=' + returnUrl;
+          return;
+        }
+
+        // Other errors - show error page
         loadingEl.style.display = 'none';
         errorEl.style.display = 'block';
         errorEl.innerHTML = `
@@ -585,7 +643,6 @@ VIEW_LOADER_HTML = r"""<!doctype html>
           <p>${err.message}</p>
           <p><a href="./index.html">Return to Search</a></p>
         `;
-        console.error('Decryption error:', err);
       }
     }
 
