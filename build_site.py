@@ -937,232 +937,10 @@ def render_message_index_page(conv: dict, msg: dict, conv_id_safe: str, msg_id_s
 </html>
 """
 
-def _detect_brotli():
-    try:
-        import brotli  # type: ignore
-
-        return ("python", brotli)
-    except Exception:
-        pass
-
-    try:
-        import brotlicffi as brotli  # type: ignore
-
-        return ("python", brotli)
-    except Exception:
-        pass
-
-    exe = shutil.which("brotli")
-    if exe:
-        return ("cli", exe)
-    return (None, None)
-
-
-def _should_brotli_path(path: Path) -> bool:
-    if not path.is_file():
-        return False
-    if path.name.endswith(".br"):
-        return False
-    if path.name.endswith(".gz"):
-        return False
-    if path.name.startswith("."):
-        return False
-
-    suffix = path.suffix.lower()
-    if suffix in {".html", ".css", ".js", ".json", ".txt", ".svg", ".xml", ".map"}:
-        return True
-    if suffix in {".wasm"}:
-        return True
-
-    # Pagefind outputs
-    if path.name.endswith(".pf_meta") or path.name.endswith(".pf_fragment"):
-        return True
-    if path.name.endswith(".pagefind"):
-        return True
-
-    return False
-
-
-def _brotli_mode_for_path(brotli_mod, path: Path):
-    suffix = path.suffix.lower()
-    is_text = suffix in {".html", ".css", ".js", ".json", ".txt", ".svg", ".xml", ".map"}
-    if is_text and hasattr(brotli_mod, "MODE_TEXT"):
-        return brotli_mod.MODE_TEXT
-    if hasattr(brotli_mod, "MODE_GENERIC"):
-        return brotli_mod.MODE_GENERIC
-    return None
-
-
-def _maybe_write_brotli_file(
-    src: Path,
-    quality: int,
-    lgwin: int,
-    brotli_kind,
-    brotli_impl,
-    *,
-    min_savings_ratio: float = 0.01,
-) -> bool:
-    dst = src.with_name(src.name + ".br")
-
-    try:
-        src_stat = src.stat()
-    except FileNotFoundError:
-        return False
-
-    if dst.exists():
-        try:
-            dst_stat = dst.stat()
-            if dst_stat.st_mtime >= src_stat.st_mtime and dst_stat.st_size > 0:
-                return False
-        except FileNotFoundError:
-            pass
-
-    tmp = dst.with_name(dst.name + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
-
-    if brotli_kind == "python":
-        brotli_mod = brotli_impl
-        mode = _brotli_mode_for_path(brotli_mod, src)
-        compressor_kwargs = {"quality": quality, "lgwin": lgwin}
-        if mode is not None:
-            compressor_kwargs["mode"] = mode
-        compressor = brotli_mod.Compressor(**compressor_kwargs)
-
-        with src.open("rb") as f_in, tmp.open("wb") as f_out:
-            while True:
-                chunk = f_in.read(256 * 1024)
-                if not chunk:
-                    break
-                out = compressor.process(chunk)
-                if out:
-                    f_out.write(out)
-            tail = compressor.finish()
-            if tail:
-                f_out.write(tail)
-    elif brotli_kind == "cli":
-        exe = brotli_impl
-        # -f: overwrite, -q: quality, --lgwin: window size
-        subprocess.run(
-            [exe, "-f", "-q", str(quality), "--lgwin", str(lgwin), "-o", str(tmp), str(src)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    else:
-        return False
-
-    try:
-        tmp_size = tmp.stat().st_size
-    except FileNotFoundError:
-        return False
-
-    if tmp_size <= 0:
-        tmp.unlink(missing_ok=True)
-        return False
-
-    # Only keep if it actually shrinks meaningfully.
-    if tmp_size >= int(src_stat.st_size * (1.0 - min_savings_ratio)):
-        tmp.unlink(missing_ok=True)
-        return False
-
-    tmp.replace(dst)
-    try:
-        os.utime(dst, (src_stat.st_atime, src_stat.st_mtime))
-    except Exception:
-        pass
-    return True
-
-
-def brotli_precompress_site(
-    site_root: Path,
-    *,
-    include_messages: bool,
-    quality: int,
-    lgwin: int,
-) -> int:
-    brotli_kind, brotli_impl = _detect_brotli()
-    if not brotli_kind:
-        return 0
-
-    roots = [site_root / "assets", site_root / "pagefind", site_root / "view"]
-    if include_messages:
-        roots.append(site_root / "messages")
-
-    wrote = 0
-    seen = set()
-    # Only consider files directly under site/ at the top level (e.g., site/index.html).
-    if site_root.exists():
-        for path in sorted(site_root.iterdir()):
-            if not path.is_file():
-                continue
-            if not _should_brotli_path(path):
-                continue
-            seen.add(path)
-            try:
-                if _maybe_write_brotli_file(path, quality, lgwin, brotli_kind, brotli_impl):
-                    wrote += 1
-            except Exception:
-                continue
-
-    for root in roots:
-        if not root.exists():
-            continue
-        if root.is_file():
-            candidates = [root]
-        else:
-            candidates = sorted(root.rglob("*"))
-        for path in candidates:
-            if not _should_brotli_path(path):
-                continue
-            if path in seen:
-                continue
-            seen.add(path)
-            try:
-                if _maybe_write_brotli_file(path, quality, lgwin, brotli_kind, brotli_impl):
-                    wrote += 1
-                    if wrote % 500 == 0:
-                        print(f"\r  Compressed {wrote} files...", end='', flush=True)
-            except Exception:
-                # Compression should never break the build output.
-                continue
-
-    if wrote > 0:
-        print()  # Final newline after progress
-    return wrote
-
-
 def main(argv=None):
     import argparse
 
     parser = argparse.ArgumentParser(description="Build the static offline chat search site.")
-    parser.add_argument(
-        "--brotli-only",
-        action="store_true",
-        help="Only generate .br files for existing site/ output (no page regeneration).",
-    )
-    parser.add_argument(
-        "--no-brotli",
-        action="store_true",
-        help="Disable Brotli precompression even if Brotli is available.",
-    )
-    parser.add_argument(
-        "--brotli-all",
-        action="store_true",
-        help="Also Brotli-compress site/messages/ (usually unnecessary and slower).",
-    )
-    parser.add_argument(
-        "--brotli-quality",
-        type=int,
-        default=int(os.environ.get("BROTLI_QUALITY", "5")),
-        help="Brotli quality (0-11). Default: 5 or $BROTLI_QUALITY.",
-    )
-    parser.add_argument(
-        "--brotli-lgwin",
-        type=int,
-        default=int(os.environ.get("BROTLI_LGWIN", "22")),
-        help="Brotli window size (10-24). Default: 22 or $BROTLI_LGWIN.",
-    )
     parser.add_argument(
         "--encryption-key",
         type=str,
@@ -1183,8 +961,8 @@ def main(argv=None):
         "--encryption-compression",
         type=str,
         choices=["none", "gzip", "brotli"],
-        default="none",
-        help="Compression before encryption (none=maximum compatibility, gzip=74%% smaller, brotli=78%% smaller). Requires modern browsers (Chrome 80+, Firefox 68+, Safari 16.4+).",
+        default="gzip",
+        help="Compression before encryption (none=maximum compatibility, gzip=94%% smaller, brotli=97%% smaller). Default: gzip. Requires modern browsers (Chrome 80+, Firefox 68+, Safari 16.4+).",
     )
     parser.add_argument(
         "--delete-without-asking",
@@ -1230,151 +1008,130 @@ def main(argv=None):
 
     site_root = Path("site")
 
-    if not args.brotli_only:
-        # Clean slate: remove entire site directory
-        if site_root.exists():
-            if not args.delete_without_asking:
-                response = input(f"Delete existing {site_root}/ directory? [y/N]: ").strip().lower()
-                if response not in ('y', 'yes'):
-                    print("Aborted.")
-                    sys.exit(0)
-            shutil.rmtree(site_root)
-            print(f"Deleted {site_root}/")
-        site_root.mkdir(parents=True, exist_ok=True)
+    # Clean slate: remove entire site directory
+    if site_root.exists():
+        if not args.delete_without_asking:
+            response = input(f"Delete existing {site_root}/ directory? [y/N]: ").strip().lower()
+            if response not in ('y', 'yes'):
+                print("Aborted.")
+                sys.exit(0)
+        shutil.rmtree(site_root)
+        print(f"Deleted {site_root}/")
+    site_root.mkdir(parents=True, exist_ok=True)
 
-        # Step 1: Load conversations
-        print("\n=== Step 1/5: Loading conversations ===")
-        conversations = []
-        chatgpt_path = Path("conversations.json")
-        if chatgpt_path.exists():
-            conversations.extend(load_chatgpt(chatgpt_path))
-        claude_path = Path("conversations-claude.json")
-        if claude_path.exists():
-            conversations.extend(load_claude(claude_path))
-        print(f"Loaded {len(conversations)} conversations")
+    # Step 1: Load conversations
+    print("\n=== Step 1/5: Loading conversations ===")
+    conversations = []
+    chatgpt_path = Path("conversations.json")
+    if chatgpt_path.exists():
+        conversations.extend(load_chatgpt(chatgpt_path))
+    claude_path = Path("conversations-claude.json")
+    if claude_path.exists():
+        conversations.extend(load_claude(claude_path))
+    print(f"Loaded {len(conversations)} conversations")
 
-        # Step 2: Set up assets and templates
-        print("\n=== Step 2/5: Setting up assets ===")
-        setup_assets(site_root, encryption_enabled=bool(encryption_key))
-        print("Assets and templates ready")
+    # Step 2: Set up assets and templates
+    print("\n=== Step 2/5: Setting up assets ===")
+    setup_assets(site_root, encryption_enabled=bool(encryption_key))
+    print("Assets and templates ready")
 
-        # Step 3: Generate message index pages (for Pagefind)
-        print("\n=== Step 3/5: Generating message index pages ===")
-        # Use a temporary directory for plaintext indexing to avoid leaking them in site/
-        temp_index_root = Path("temp_index_build")
-        if temp_index_root.exists():
-            shutil.rmtree(temp_index_root)
-        temp_index_root.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            message_pages = write_message_index_pages(conversations, temp_index_root)
-            print(f"Wrote {message_pages} message index pages to temporary directory")
+    # Step 3: Generate message index pages (for Pagefind)
+    print("\n=== Step 3/5: Generating message index pages ===")
+    # Use a temporary directory for plaintext indexing to avoid leaking them in site/
+    temp_index_root = Path("temp_index_build")
+    if temp_index_root.exists():
+        shutil.rmtree(temp_index_root)
+    temp_index_root.mkdir(parents=True, exist_ok=True)
 
-            # Step 4: Run Pagefind to build search index
-            print("\n=== Step 4/5: Building search index with Pagefind ===")
-            pagefind_bin = None
-            if args.pagefind:
-                candidate = Path(args.pagefind).expanduser()
+    try:
+        message_pages = write_message_index_pages(conversations, temp_index_root)
+        print(f"Wrote {message_pages} message index pages to temporary directory")
+
+        # Step 4: Run Pagefind to build search index
+        print("\n=== Step 4/5: Building search index with Pagefind ===")
+        pagefind_bin = None
+        if args.pagefind:
+            candidate = Path(args.pagefind).expanduser()
+            if candidate.exists() and candidate.is_file():
+                pagefind_bin = candidate
+            else:
+                print(f"ERROR: --pagefind binary not found at {candidate}")
+                sys.exit(1)
+        else:
+            for candidate in [Path("pagefind"), Path("./pagefind"), Path("bin/pagefind")]:
                 if candidate.exists() and candidate.is_file():
                     pagefind_bin = candidate
+                    break
+
+        if not pagefind_bin:
+            print("WARNING: pagefind binary not found, skipping index generation")
+        else:
+            # Ensure output directory exists
+            (site_root / "pagefind").mkdir(parents=True, exist_ok=True)
+
+            # Use absolute path to ensure subprocess can find the binary
+            # We index the temporary directory, but output to the real site directory
+            cmd = [
+                str(pagefind_bin.resolve()),
+                "--site", str(temp_index_root),
+                "--output-path", str(site_root / "pagefind"),
+                "--force-language", "en"
+            ]
+            if encryption_key:
+                cmd.extend(["--encryption-key", encryption_key])
+                cmd.extend(["--encryption-iterations", str(encryption_iterations)])
+                if args.encryption_salt:
+                    cmd.extend(["--encryption-salt", args.encryption_salt])
                 else:
-                    print(f"ERROR: --pagefind binary not found at {candidate}")
-                    sys.exit(1)
-            else:
-                for candidate in [Path("pagefind"), Path("./pagefind"), Path("bin/pagefind")]:
-                    if candidate.exists() and candidate.is_file():
-                        pagefind_bin = candidate
-                        break
+                    cmd.extend(["--encryption-salt", encryption_salt.hex()])
 
-            if not pagefind_bin:
-                print("WARNING: pagefind binary not found, skipping index generation")
-            else:
-                # Ensure output directory exists
-                (site_root / "pagefind").mkdir(parents=True, exist_ok=True)
-
-                # Use absolute path to ensure subprocess can find the binary
-                # We index the temporary directory, but output to the real site directory
-                cmd = [
-                    str(pagefind_bin.resolve()),
-                    "--site", str(temp_index_root),
-                    "--output-path", str(site_root / "pagefind"),
-                    "--force-language", "en"
-                ]
+            print(f"Running: {pagefind_bin.name} --site {temp_index_root} --output-path site/pagefind ...")
+            try:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                if result.stdout:
+                    print(result.stdout)
                 if encryption_key:
-                    cmd.extend(["--encryption-key", encryption_key])
-                    cmd.extend(["--encryption-iterations", str(encryption_iterations)])
-                    if args.encryption_salt:
-                        cmd.extend(["--encryption-salt", args.encryption_salt])
-                    else:
-                        cmd.extend(["--encryption-salt", encryption_salt.hex()])
+                    print("Pagefind encrypted index generated successfully")
+                else:
+                    print("Pagefind index generated successfully")
+            except subprocess.CalledProcessError as e:
+                print(f"ERROR: Pagefind failed with exit code {e.returncode}")
+                if e.stderr:
+                    print(e.stderr)
+                sys.exit(1)
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                print(f"ERROR: Failed to run pagefind binary: {e}")
+                print(f"Binary location: {pagefind_bin.resolve()}")
+                print("\nIf on macOS and downloaded the binary, you may need to remove quarantine:")
+                print(f"  xattr -d com.apple.quarantine {pagefind_bin}")
+                sys.exit(1)
 
-                print(f"Running: {pagefind_bin.name} --site {temp_index_root} --output-path site/pagefind ...")
-                try:
-                    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-                    if result.stdout:
-                        print(result.stdout)
-                    if encryption_key:
-                        print("Pagefind encrypted index generated successfully")
-                    else:
-                        print("Pagefind index generated successfully")
-                except subprocess.CalledProcessError as e:
-                    print(f"ERROR: Pagefind failed with exit code {e.returncode}")
-                    if e.stderr:
-                        print(e.stderr)
-                    sys.exit(1)
-                except (FileNotFoundError, PermissionError, OSError) as e:
-                    print(f"ERROR: Failed to run pagefind binary: {e}")
-                    print(f"Binary location: {pagefind_bin.resolve()}")
-                    print("\nIf on macOS and downloaded the binary, you may need to remove quarantine:")
-                    print(f"  xattr -d com.apple.quarantine {pagefind_bin}")
-                    sys.exit(1)
+    finally:
+        # Always clean up temporary plaintext files
+        if temp_index_root.exists():
+            shutil.rmtree(temp_index_root)
+            print("Cleaned up temporary plaintext message pages")
 
-        finally:
-            # Always clean up temporary plaintext files
-            if temp_index_root.exists():
-                shutil.rmtree(temp_index_root)
-                print("Cleaned up temporary plaintext message pages")
-
-        if encryption_key:
-            print("\n=== Step 5/5: Generating encrypted conversation pages ===")
-        else:
-            print("\n=== Step 5/5: Generating conversation pages ===")
-
-        # Step 5: Generate conversation pages (encrypted if key provided)
-        conversation_pages = write_conversation_pages(
-            conversations,
-            site_root,
-            encryption_key=encryption_key,
-            encryption_salt=encryption_salt,
-            encryption_iterations=encryption_iterations,
-            encryption_compression=encryption_compression
-        )
-        if encryption_key:
-            print(f"Wrote {conversation_pages} encrypted conversation pages")
-        else:
-            print(f"Wrote {conversation_pages} conversation pages")
-
-        print(f"\n✓ Build complete! Output in site/")
+    if encryption_key:
+        print("\n=== Step 5/5: Generating encrypted conversation pages ===")
     else:
-        # For brotli-only mode, site must already exist
-        if not site_root.exists():
-            print("ERROR: site/ directory not found (required for --brotli-only)")
-            sys.exit(1)
+        print("\n=== Step 5/5: Generating conversation pages ===")
 
-    if not args.no_brotli:
-        brotli_kind, _ = _detect_brotli()
-        if brotli_kind:
-            print("\nCompressing with Brotli...")
-        wrote = brotli_precompress_site(
-            site_root,
-            include_messages=bool(args.brotli_all),
-            quality=max(0, min(11, int(args.brotli_quality))),
-            lgwin=max(10, min(24, int(args.brotli_lgwin))),
-        )
-        if wrote:
-            print(f"Wrote {wrote} Brotli .br files")
-        elif args.brotli_only and not brotli_kind:
-            print("Brotli not available; no .br files written")
+    # Step 5: Generate conversation pages (encrypted if key provided)
+    conversation_pages = write_conversation_pages(
+        conversations,
+        site_root,
+        encryption_key=encryption_key,
+        encryption_salt=encryption_salt,
+        encryption_iterations=encryption_iterations,
+        encryption_compression=encryption_compression
+    )
+    if encryption_key:
+        print(f"Wrote {conversation_pages} encrypted conversation pages")
+    else:
+        print(f"Wrote {conversation_pages} conversation pages")
+
+    print(f"\n✓ Build complete! Output in site/")
 
 
 if __name__ == "__main__":

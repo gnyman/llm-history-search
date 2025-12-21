@@ -22,22 +22,14 @@ You will need `python3` with `cryptography` , I recommend `uv run --with cryptog
 ## `--help`
 
 ```
-usage: build_site.py [-h] [--brotli-only] [--no-brotli] [--brotli-all] [--brotli-quality BROTLI_QUALITY]
-                     [--brotli-lgwin BROTLI_LGWIN] [--encryption-key ENCRYPTION_KEY]
-                     [--encryption-iterations ENCRYPTION_ITERATIONS] [--encryption-salt ENCRYPTION_SALT]
-                     [--encryption-compression {none,gzip,brotli}] [--delete-without-asking] [--pagefind PAGEFIND]
+usage: build_site.py [-h] [--encryption-key ENCRYPTION_KEY] [--encryption-iterations ENCRYPTION_ITERATIONS]
+                     [--encryption-salt ENCRYPTION_SALT] [--encryption-compression {none,gzip,brotli}]
+                     [--delete-without-asking] [--pagefind PAGEFIND]
 
 Build the static offline chat search site.
 
 options:
   -h, --help            show this help message and exit
-  --brotli-only         Only generate .br files for existing site/ output (no page regeneration).
-  --no-brotli           Disable Brotli precompression even if Brotli is available.
-  --brotli-all          Also Brotli-compress site/messages/ (usually unnecessary and slower).
-  --brotli-quality BROTLI_QUALITY
-                        Brotli quality (0-11). Default: 5 or $BROTLI_QUALITY.
-  --brotli-lgwin BROTLI_LGWIN
-                        Brotli window size (10-24). Default: 22 or $BROTLI_LGWIN.
   --encryption-key ENCRYPTION_KEY
                         Encryption key for Pagefind index and conversation pages. Can also use ENCRYPTION_KEY env
                         var.
@@ -46,8 +38,7 @@ options:
   --encryption-salt ENCRYPTION_SALT
                         Hex-encoded salt for key derivation. If not provided, generates random 16-byte salt.
   --encryption-compression {none,gzip,brotli}
-                        Compression before encryption (none=maximum compatibility, gzip=74% smaller, brotli=78%
-                        smaller). Requires modern browsers (Chrome 80+, Firefox 68+, Safari 16.4+).
+                        Compression before encryption (usualy a good thing, requires 2023+ browser)
   --delete-without-asking
                         Delete site/ directory without prompting (default: ask first).
   --pagefind PAGEFIND   Path to Pagefind binary (defaults to ./pagefind or bin/pagefind).
