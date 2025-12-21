@@ -18,3 +18,7 @@ bin/
 data/
 
 __pycache__/
+.uv-cache/
+.claude/
+
+*.swp

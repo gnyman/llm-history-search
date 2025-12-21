@@ -9,13 +9,14 @@ export class ChatCrypto {
   }
 
   /**
-   * Decrypt encrypted data in Pagefind format:
+   * Decrypt encrypted data in format:
    * [12 bytes: "pagefind_e2c" magic]
+   * [1 byte: compression type (0x00=none, 0x01=gzip, 0x02=brotli)]
    * [1 byte: salt length]
    * [4 bytes: iterations, big-endian]
    * [N bytes: salt]
    * [12 bytes: nonce]
-   * [remaining: AES-256-GCM ciphertext]
+   * [remaining: AES-256-GCM ciphertext of possibly-compressed data]
    */
   async decrypt(encryptedData) {
     // Check magic header
@@ -25,20 +26,26 @@ export class ChatCrypto {
     }
 
     // Parse header
-    if (encryptedData.length < 12 + 1 + 4 + 12) {
+    if (encryptedData.length < 12 + 1 + 1 + 4 + 12) {
       throw new Error('Encrypted file header is too short');
     }
 
-    const saltLen = encryptedData[12];
+    // Parse compression byte (always present)
+    const compressionType = encryptedData[12];
+    if (compressionType > 0x02) {
+      throw new Error(`Unsupported compression type: ${compressionType}`);
+    }
+
+    const saltLen = encryptedData[13];
     const iterationsView = new DataView(
       encryptedData.buffer,
-      encryptedData.byteOffset + 13,
+      encryptedData.byteOffset + 14,
       4
     );
     const iterations = iterationsView.getUint32(0, false); // big-endian
 
     // Extract components
-    const saltStart = 17;  // 12 (magic) + 1 (salt_len) + 4 (iterations)
+    const saltStart = 18;  // 12 (magic) + 1 (compression) + 1 (salt_len) + 4 (iterations)
     const saltEnd = saltStart + saltLen;
     const nonceStart = saltEnd;
     const nonceEnd = nonceStart + 12;
@@ -68,17 +75,27 @@ export class ChatCrypto {
       ['decrypt']
     );
 
+    let decrypted;
     try {
-      const decrypted = await crypto.subtle.decrypt(
+      decrypted = await crypto.subtle.decrypt(
         { name: 'AES-GCM', iv: nonce },
         key,
         ciphertext
       );
-
-      return new Uint8Array(decrypted);
     } catch (e) {
       throw new Error('Decryption failed (wrong key or corrupted data)');
     }
+
+    let result = new Uint8Array(decrypted);
+
+    // Decompress if needed
+    if (compressionType === 0x01) {
+      result = await this.decompressGzip(result);
+    } else if (compressionType === 0x02) {
+      result = await this.decompressBrotli(result);
+    }
+
+    return result;
   }
 
   /**
@@ -123,5 +140,61 @@ export class ChatCrypto {
   async decryptText(encryptedData) {
     const decrypted = await this.decrypt(encryptedData);
     return new TextDecoder().decode(decrypted);
+  }
+
+  /**
+   * Decompress data using DecompressionStream
+   */
+  async decompressStream(data, format) {
+    const ds = new DecompressionStream(format);
+    const writer = ds.writable.getWriter();
+    writer.write(data);
+    writer.close();
+
+    const reader = ds.readable.getReader();
+    const chunks = [];
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+
+    // Concatenate all chunks
+    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    return result;
+  }
+
+  /**
+   * Decompress gzip-compressed data
+   */
+  async decompressGzip(data) {
+    if (typeof DecompressionStream === 'undefined') {
+      throw new Error(
+        'Browser does not support gzip decompression. ' +
+        'Requires Chrome 80+, Firefox 68+, Safari 16.4+, or Edge 80+.'
+      );
+    }
+    return await this.decompressStream(data, 'gzip');
+  }
+
+  /**
+   * Decompress brotli-compressed data
+   */
+  async decompressBrotli(data) {
+    if (typeof DecompressionStream === 'undefined') {
+      throw new Error(
+        'Browser does not support brotli decompression. ' +
+        'Requires Chrome 80+, Firefox 68+, Safari 16.4+, or Edge 80+.'
+      );
+    }
+    return await this.decompressStream(data, 'deflate-raw');
   }
 }

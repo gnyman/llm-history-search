@@ -99,28 +99,46 @@ def derive_encryption_key(password: str, salt: bytes, iterations: int) -> bytes:
     return kdf.derive(password.encode('utf-8'))
 
 
-def encrypt_content(plaintext: bytes, key_bytes: bytes, salt: bytes, iterations: int) -> bytes:
+def encrypt_content(plaintext: bytes, key_bytes: bytes, salt: bytes, iterations: int, compression: str = "none") -> bytes:
     """
-    Encrypt content using AES-256-GCM with pre-derived key.
-    Returns encrypted data in Pagefind-compatible format:
+    Encrypt content using AES-256-GCM with pre-derived key and optional compression.
+    Returns encrypted data in format:
     [12 bytes: "pagefind_e2c" magic]
+    [1 byte: compression type (0x00=none, 0x01=gzip, 0x02=brotli)]
     [1 byte: salt length]
     [4 bytes: iterations, big-endian]
     [N bytes: salt]
     [12 bytes: nonce]
-    [remaining: AES-256-GCM ciphertext]
+    [remaining: AES-256-GCM ciphertext of possibly-compressed data]
 
     Args:
         plaintext: Data to encrypt
         key_bytes: Pre-derived 256-bit key (use derive_encryption_key)
         salt: Salt used for key derivation (stored in output)
         iterations: Iterations used for key derivation (stored in output)
+        compression: Compression type ("none", "gzip", or "brotli")
     """
     if not ENCRYPTION_AVAILABLE:
         raise RuntimeError("Encryption requires 'cryptography' library. Install with: pip install cryptography")
 
     if len(salt) > 255:
         raise ValueError("Salt length must be <= 255 bytes")
+
+    # Map compression name to byte value
+    compression_map = {"none": 0x00, "gzip": 0x01, "brotli": 0x02}
+    compression_byte = compression_map[compression]
+
+    # Compress before encrypting if requested
+    if compression == "gzip":
+        import gzip
+        plaintext = gzip.compress(plaintext, compresslevel=6)
+    elif compression == "brotli":
+        try:
+            import brotli
+            plaintext = brotli.compress(plaintext, quality=5)
+        except ImportError:
+            print("WARNING: brotli library not available, falling back to no compression")
+            compression_byte = 0x00
 
     # Generate random 12-byte nonce for AES-GCM
     nonce = secrets.token_bytes(12)
@@ -129,9 +147,10 @@ def encrypt_content(plaintext: bytes, key_bytes: bytes, salt: bytes, iterations:
     cipher = AESGCM(key_bytes)
     ciphertext = cipher.encrypt(nonce, plaintext, None)
 
-    # Build encrypted format
+    # Build encrypted format with compression byte
     result = bytearray()
     result.extend(b"pagefind_e2c")  # Magic (12 bytes)
+    result.append(compression_byte)  # Compression type (1 byte)
     result.append(len(salt))  # Salt length (1 byte)
     result.extend(struct.pack('>I', iterations))  # Iterations, big-endian (4 bytes)
     result.extend(salt)  # Salt (N bytes)
@@ -174,6 +193,7 @@ INDEX_HTML = r"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; img-src 'self' data:;">
   <title>Chat Search</title>
   <link rel="stylesheet" href="./assets/framework.css">
   <link rel="stylesheet" href="./assets/chat.css">
@@ -195,6 +215,17 @@ INDEX_HTML = r"""<!doctype html>
     }
     #key-error.show {
       display: block;
+    }
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+      font-size: 0.9em;
+      cursor: pointer;
+    }
+    .checkbox-label input {
+      margin: 0;
     }
   </style>
 </head>
@@ -220,6 +251,10 @@ INDEX_HTML = r"""<!doctype html>
         Encryption Key
         <input type="password" id="key-input" required autocomplete="off" />
       </label>
+      <label class="checkbox-label">
+        <input type="checkbox" id="key-remember" checked />
+        Remember me on this device
+      </label>
       <div id="key-error"></div>
       <button type="submit" id="key-submit">Unlock</button>
     </form>
@@ -228,10 +263,23 @@ INDEX_HTML = r"""<!doctype html>
   <script type="module">
     import { init, options, search as pagefindSearch, preload } from './pagefind/pagefind.js';
 
+    // Configure marked to escape all raw HTML to prevent XSS
+    const renderer = {
+      html(text) {
+        return text.replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
+      }
+    };
+    marked.use({ renderer });
+
     const searchInput = document.getElementById('search');
     const resultsEl = document.getElementById('results');
     const keyPromptDialog = document.getElementById('key-prompt');
     const keyInput = document.getElementById('key-input');
+    const keyRemember = document.getElementById('key-remember');
     const keyError = document.getElementById('key-error');
     const keySubmitBtn = document.getElementById('key-submit');
 
@@ -241,11 +289,13 @@ INDEX_HTML = r"""<!doctype html>
     const isEncrypted = {is_encrypted};
 
     async function getEncryptionKey() {
-      // Check localStorage first
-      const stored = localStorage.getItem('chat-search-encryption-key');
-      if (stored) {
-        return stored;
-      }
+      // Check localStorage first (persistent)
+      let stored = localStorage.getItem('chat-search-encryption-key');
+      if (stored) return stored;
+
+      // Check sessionStorage second (session only)
+      stored = sessionStorage.getItem('chat-search-encryption-key');
+      if (stored) return stored;
 
       // Prompt user for key
       return await promptUserForKey();
@@ -261,6 +311,7 @@ INDEX_HTML = r"""<!doctype html>
         const handleSubmit = async (e) => {
           e.preventDefault();
           const key = keyInput.value.trim();
+          const remember = keyRemember.checked;
           if (!key) return;
 
           keySubmitBtn.disabled = true;
@@ -274,8 +325,13 @@ INDEX_HTML = r"""<!doctype html>
             await init();
             await preload('');
 
-            // Success! Store key and close dialog
-            localStorage.setItem('chat-search-encryption-key', key);
+            // Success! Store key based on user preference
+            if (remember) {
+              localStorage.setItem('chat-search-encryption-key', key);
+            } else {
+              sessionStorage.setItem('chat-search-encryption-key', key);
+            }
+
             keyPromptDialog.close();
             keyPromptDialog.removeEventListener('submit', handleSubmit);
             resolve(key);
@@ -486,8 +542,12 @@ VIEW_LOADER_HTML = r"""<!doctype html>
           throw new Error('Missing source or conversation ID in URL');
         }
 
-        // Get encryption key from localStorage
-        const key = localStorage.getItem('chat-search-encryption-key');
+        // Get encryption key from storage
+        let key = localStorage.getItem('chat-search-encryption-key');
+        if (!key) {
+          key = sessionStorage.getItem('chat-search-encryption-key');
+        }
+        
         if (!key) {
           // Redirect to index to prompt for key
           const returnUrl = encodeURIComponent(location.pathname + location.search + hash);
@@ -706,9 +766,9 @@ def load_claude(path: Path):
     return conversations
 
 
-def write_message_index_pages(conversations, site_root: Path) -> int:
+def write_message_index_pages(conversations, root_dir: Path) -> int:
     """Write message index pages for Pagefind (always unencrypted)."""
-    msg_root = site_root / "messages"
+    msg_root = root_dir / "messages"
     msg_root.mkdir(parents=True, exist_ok=True)
 
     message_pages = 0
@@ -732,7 +792,7 @@ def write_message_index_pages(conversations, site_root: Path) -> int:
     return message_pages
 
 
-def write_conversation_pages(conversations, site_root: Path, encryption_key: str = None, encryption_salt: bytes = None, encryption_iterations: int = 100000) -> int:
+def write_conversation_pages(conversations, site_root: Path, encryption_key: str = None, encryption_salt: bytes = None, encryption_iterations: int = 100000, encryption_compression: str = "none") -> int:
     """Write conversation view pages (encrypted if key provided)."""
     assets_dir = site_root / "assets"
     view_root = site_root / "view"
@@ -766,7 +826,8 @@ def write_conversation_pages(conversations, site_root: Path, encryption_key: str
                 conversation_html.encode('utf-8'),
                 derived_key,  # Use pre-derived key (fast)
                 encryption_salt,
-                encryption_iterations
+                encryption_iterations,
+                encryption_compression
             )
             view_path.write_bytes(encrypted_data)
         else:
@@ -1119,9 +1180,21 @@ def main(argv=None):
         help="Hex-encoded salt for key derivation. If not provided, generates random 16-byte salt.",
     )
     parser.add_argument(
+        "--encryption-compression",
+        type=str,
+        choices=["none", "gzip", "brotli"],
+        default="none",
+        help="Compression before encryption (none=maximum compatibility, gzip=74%% smaller, brotli=78%% smaller). Requires modern browsers (Chrome 80+, Firefox 68+, Safari 16.4+).",
+    )
+    parser.add_argument(
         "--delete-without-asking",
         action="store_true",
         help="Delete site/ directory without prompting (default: ask first).",
+    )
+    parser.add_argument(
+        "--pagefind",
+        type=str,
+        help="Path to Pagefind binary (defaults to ./pagefind or bin/pagefind).",
     )
 
     args = parser.parse_args(argv)
@@ -1129,6 +1202,13 @@ def main(argv=None):
     # Get encryption key (env var takes precedence)
     encryption_key = os.environ.get("ENCRYPTION_KEY") or args.encryption_key
     encryption_iterations = args.encryption_iterations
+    encryption_compression = args.encryption_compression if encryption_key else "none"
+
+    # Validate encryption key
+    if encryption_key == "CHANGEME":
+        print("ERROR: You must change the encryption key from 'CHANGEME' to your own secure key.")
+        print("Use a strong, unique password for --encryption-key")
+        sys.exit(1)
 
     # Generate or parse salt
     encryption_salt = None
@@ -1180,65 +1260,85 @@ def main(argv=None):
 
         # Step 3: Generate message index pages (for Pagefind)
         print("\n=== Step 3/5: Generating message index pages ===")
-        message_pages = write_message_index_pages(conversations, site_root)
-        print(f"Wrote {message_pages} message index pages")
+        # Use a temporary directory for plaintext indexing to avoid leaking them in site/
+        temp_index_root = Path("temp_index_build")
+        if temp_index_root.exists():
+            shutil.rmtree(temp_index_root)
+        temp_index_root.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            message_pages = write_message_index_pages(conversations, temp_index_root)
+            print(f"Wrote {message_pages} message index pages to temporary directory")
 
-        # Step 4: Run Pagefind to build search index
-        print("\n=== Step 4/5: Building search index with Pagefind ===")
-        pagefind_bin = None
-        for candidate in [Path("pagefind"), Path("./pagefind"), Path("bin/pagefind")]:
-            if candidate.exists() and candidate.is_file():
-                pagefind_bin = candidate
-                break
-
-        if not pagefind_bin:
-            print("WARNING: pagefind binary not found, skipping index generation")
-        else:
-            # Use absolute path to ensure subprocess can find the binary
-            cmd = [
-                str(pagefind_bin.resolve()),
-                "--site", "site",
-                "--output-path", "site/pagefind",
-                "--force-language", "en"
-            ]
-            if encryption_key:
-                cmd.extend(["--encryption-key", encryption_key])
-                cmd.extend(["--encryption-iterations", str(encryption_iterations)])
-                if args.encryption_salt:
-                    cmd.extend(["--encryption-salt", args.encryption_salt])
+            # Step 4: Run Pagefind to build search index
+            print("\n=== Step 4/5: Building search index with Pagefind ===")
+            pagefind_bin = None
+            if args.pagefind:
+                candidate = Path(args.pagefind).expanduser()
+                if candidate.exists() and candidate.is_file():
+                    pagefind_bin = candidate
                 else:
-                    cmd.extend(["--encryption-salt", encryption_salt.hex()])
-
-            print(f"Running: {pagefind_bin.name} --site site ...")
-            try:
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-                if result.stdout:
-                    print(result.stdout)
-                if encryption_key:
-                    print("Pagefind encrypted index generated successfully")
-                else:
-                    print("Pagefind index generated successfully")
-            except subprocess.CalledProcessError as e:
-                print(f"ERROR: Pagefind failed with exit code {e.returncode}")
-                if e.stderr:
-                    print(e.stderr)
-                sys.exit(1)
-            except (FileNotFoundError, PermissionError, OSError) as e:
-                print(f"ERROR: Failed to run pagefind binary: {e}")
-                print(f"Binary location: {pagefind_bin.resolve()}")
-                print("\nIf on macOS and downloaded the binary, you may need to remove quarantine:")
-                print(f"  xattr -d com.apple.quarantine {pagefind_bin}")
-                sys.exit(1)
-
-            # Delete message index pages after Pagefind indexing (security cleanup)
-            if encryption_key:
-                print("\n=== Step 5/5: Security cleanup and generating encrypted conversations ===")
-                messages_dir = site_root / "messages"
-                if messages_dir.exists():
-                    shutil.rmtree(messages_dir)
-                    print("Deleted plaintext message index pages")
+                    print(f"ERROR: --pagefind binary not found at {candidate}")
+                    sys.exit(1)
             else:
-                print("\n=== Step 5/5: Generating conversation pages ===")
+                for candidate in [Path("pagefind"), Path("./pagefind"), Path("bin/pagefind")]:
+                    if candidate.exists() and candidate.is_file():
+                        pagefind_bin = candidate
+                        break
+
+            if not pagefind_bin:
+                print("WARNING: pagefind binary not found, skipping index generation")
+            else:
+                # Ensure output directory exists
+                (site_root / "pagefind").mkdir(parents=True, exist_ok=True)
+
+                # Use absolute path to ensure subprocess can find the binary
+                # We index the temporary directory, but output to the real site directory
+                cmd = [
+                    str(pagefind_bin.resolve()),
+                    "--site", str(temp_index_root),
+                    "--output-path", str(site_root / "pagefind"),
+                    "--force-language", "en"
+                ]
+                if encryption_key:
+                    cmd.extend(["--encryption-key", encryption_key])
+                    cmd.extend(["--encryption-iterations", str(encryption_iterations)])
+                    if args.encryption_salt:
+                        cmd.extend(["--encryption-salt", args.encryption_salt])
+                    else:
+                        cmd.extend(["--encryption-salt", encryption_salt.hex()])
+
+                print(f"Running: {pagefind_bin.name} --site {temp_index_root} --output-path site/pagefind ...")
+                try:
+                    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    if result.stdout:
+                        print(result.stdout)
+                    if encryption_key:
+                        print("Pagefind encrypted index generated successfully")
+                    else:
+                        print("Pagefind index generated successfully")
+                except subprocess.CalledProcessError as e:
+                    print(f"ERROR: Pagefind failed with exit code {e.returncode}")
+                    if e.stderr:
+                        print(e.stderr)
+                    sys.exit(1)
+                except (FileNotFoundError, PermissionError, OSError) as e:
+                    print(f"ERROR: Failed to run pagefind binary: {e}")
+                    print(f"Binary location: {pagefind_bin.resolve()}")
+                    print("\nIf on macOS and downloaded the binary, you may need to remove quarantine:")
+                    print(f"  xattr -d com.apple.quarantine {pagefind_bin}")
+                    sys.exit(1)
+
+        finally:
+            # Always clean up temporary plaintext files
+            if temp_index_root.exists():
+                shutil.rmtree(temp_index_root)
+                print("Cleaned up temporary plaintext message pages")
+
+        if encryption_key:
+            print("\n=== Step 5/5: Generating encrypted conversation pages ===")
+        else:
+            print("\n=== Step 5/5: Generating conversation pages ===")
 
         # Step 5: Generate conversation pages (encrypted if key provided)
         conversation_pages = write_conversation_pages(
@@ -1246,7 +1346,8 @@ def main(argv=None):
             site_root,
             encryption_key=encryption_key,
             encryption_salt=encryption_salt,
-            encryption_iterations=encryption_iterations
+            encryption_iterations=encryption_iterations,
+            encryption_compression=encryption_compression
         )
         if encryption_key:
             print(f"Wrote {conversation_pages} encrypted conversation pages")
