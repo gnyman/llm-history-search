@@ -19,6 +19,9 @@ You will need `python3` with `cryptography` , I recommend `uv run --with cryptog
 
 2) inspect the output in site/ , host locally (`python -m http.server -b 127.0.0.1 808` )or transfer it to a webserver.
 
+When encryption is enabled, the browser stores derived 256-bit decryption keys rather than the
+password. “Remember me” keeps them in local storage; otherwise they remain in session storage.
+
 ## `--help`
 
 ```
@@ -34,7 +37,7 @@ options:
                         Encryption key for Pagefind index and conversation pages. Can also use ENCRYPTION_KEY env
                         var.
   --encryption-iterations ENCRYPTION_ITERATIONS
-                        PBKDF2 iterations for key derivation. Default: 100000.
+                        PBKDF2 iterations for key derivation. Default: 1000000.
   --encryption-salt ENCRYPTION_SALT
                         Hex-encoded salt for key derivation. If not provided, generates random 16-byte salt.
   --encryption-compression {none,gzip,brotli}

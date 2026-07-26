@@ -3,9 +3,30 @@
  * Compatible with Pagefind encryption format (PBKDF2 + AES-256-GCM)
  */
 export class ChatCrypto {
-  constructor(encryptionKey) {
+  constructor(encryptionKey = null, derivedKeyHex = null) {
     this.encryptionKey = encryptionKey;
+    this.derivedKeyBytes = derivedKeyHex
+      ? ChatCrypto.hexToBytes(derivedKeyHex)
+      : null;
+    if (this.derivedKeyBytes && this.derivedKeyBytes.length !== 32) {
+      throw new Error('Stored derived key is invalid');
+    }
     this.decoder = new TextDecoder();
+  }
+
+  static hexToBytes(value) {
+    if (!/^[0-9a-f]{64}$/i.test(value || '')) {
+      return new Uint8Array();
+    }
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < value.length; i += 2) {
+      bytes[i / 2] = Number.parseInt(value.slice(i, i + 2), 16);
+    }
+    return bytes;
+  }
+
+  static bytesToHex(bytes) {
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
   }
 
   /**
@@ -102,6 +123,13 @@ export class ChatCrypto {
    * Derive encryption key from password using PBKDF2-HMAC-SHA256
    */
   async deriveKey(salt, iterations) {
+    if (this.derivedKeyBytes) {
+      return this.derivedKeyBytes.slice();
+    }
+    if (!this.encryptionKey) {
+      throw new Error('No encryption password or derived key is available');
+    }
+
     const crypto = window.crypto;
     if (!crypto || !crypto.subtle) {
       throw new Error('Web Crypto API not available');

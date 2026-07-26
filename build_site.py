@@ -20,6 +20,11 @@ except ImportError:
     ENCRYPTION_AVAILABLE = False
 
 
+DEFAULT_ENCRYPTION_ITERATIONS = 1_000_000
+MIN_ENCRYPTION_ITERATIONS = 100_000
+MAX_ENCRYPTION_ITERATIONS = (1 << 32) - 1
+
+
 def sanitize_component(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
     return safe or "item"
@@ -289,6 +294,124 @@ INDEX_HTML = r"""<!doctype html>
     let activeSearchId = 0;
     let debounceTimer = null;
     const isEncrypted = {is_encrypted};
+    const encryptionConfig = {encryption_config};
+    const DERIVED_KEY_STORAGE_KEY = 'chat-search-conversation-derived-key';
+    const PAGEFIND_CACHE_KEYS_STORAGE_KEY = 'chat-search-pagefind-cache-keys';
+    const PAGEFIND_CACHE_PREFIX = 'pagefind:enc:pbkdf2:';
+    const LEGACY_PASSWORD_STORAGE_KEY = 'chat-search-encryption-key';
+    const CACHED_KEY_SENTINEL = 'use-cached-derived-key';
+    let pagefindCacheIsSessionOnly = false;
+
+    const pagefindCacheKeys = (storage, discover = false) => {
+      let keys = [];
+      try {
+        keys = JSON.parse(storage.getItem(PAGEFIND_CACHE_KEYS_STORAGE_KEY) || '[]');
+      } catch {
+        keys = [];
+      }
+      keys = keys.filter((key) =>
+        typeof key === 'string' &&
+        key.startsWith(PAGEFIND_CACHE_PREFIX) &&
+        storage.getItem(key)
+      );
+      if (discover) {
+        for (let i = 0; i < storage.length; i += 1) {
+          const key = storage.key(i);
+          if (key && key.startsWith(PAGEFIND_CACHE_PREFIX) && !keys.includes(key)) {
+            keys.push(key);
+          }
+        }
+      }
+      if (keys.length) {
+        storage.setItem(PAGEFIND_CACHE_KEYS_STORAGE_KEY, JSON.stringify(keys));
+      } else {
+        storage.removeItem(PAGEFIND_CACHE_KEYS_STORAGE_KEY);
+      }
+      return keys;
+    };
+
+    const movePagefindCache = (fromStorage, toStorage) => {
+      const keys = pagefindCacheKeys(fromStorage, true);
+      for (const key of keys) {
+        const value = fromStorage.getItem(key);
+        if (value) toStorage.setItem(key, value);
+        fromStorage.removeItem(key);
+      }
+      fromStorage.removeItem(PAGEFIND_CACHE_KEYS_STORAGE_KEY);
+      if (keys.length) {
+        toStorage.setItem(PAGEFIND_CACHE_KEYS_STORAGE_KEY, JSON.stringify(keys));
+      }
+    };
+
+    const hasStoredUnlock = (storage) =>
+      Boolean(storage.getItem(DERIVED_KEY_STORAGE_KEY)) &&
+      pagefindCacheKeys(storage).length > 0;
+
+    const clearStorageUnlock = (storage) => {
+      for (const key of pagefindCacheKeys(storage, true)) {
+        storage.removeItem(key);
+      }
+      storage.removeItem(PAGEFIND_CACHE_KEYS_STORAGE_KEY);
+      storage.removeItem(DERIVED_KEY_STORAGE_KEY);
+      storage.removeItem(LEGACY_PASSWORD_STORAGE_KEY);
+    };
+
+    const clearStoredUnlock = () => {
+      clearStorageUnlock(localStorage);
+      clearStorageUnlock(sessionStorage);
+    };
+
+    const deriveConversationKeyHex = async (password) => {
+      if (!encryptionConfig) {
+        throw new Error('Encryption configuration is missing');
+      }
+      const saltHex = encryptionConfig.salt;
+      if (!/^[0-9a-f]+$/i.test(saltHex) || saltHex.length % 2 !== 0) {
+        throw new Error('Encryption salt is invalid');
+      }
+      const salt = new Uint8Array(saltHex.length / 2);
+      for (let i = 0; i < saltHex.length; i += 2) {
+        salt[i / 2] = Number.parseInt(saltHex.slice(i, i + 2), 16);
+      }
+      const keyMaterial = await window.crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(password),
+        'PBKDF2',
+        false,
+        ['deriveBits']
+      );
+      const bits = await window.crypto.subtle.deriveBits(
+        {
+          name: 'PBKDF2',
+          salt,
+          iterations: encryptionConfig.iterations,
+          hash: 'SHA-256'
+        },
+        keyMaterial,
+        256
+      );
+      return Array.from(
+        new Uint8Array(bits),
+        (byte) => byte.toString(16).padStart(2, '0')
+      ).join('');
+    };
+
+    const configurePagefindEncryption = async (key) => {
+      await options({
+        encryptionKey: key,
+        encryptionKeyStorage: true,
+        storeKeyInLocalStorage: true,
+        noWorker: true
+      });
+    };
+
+    const finishPagefindCacheStorage = () => {
+      if (pagefindCacheIsSessionOnly) {
+        movePagefindCache(localStorage, sessionStorage);
+      } else {
+        pagefindCacheKeys(localStorage, true);
+      }
+    };
 
     async function getEncryptionKey() {
       // Check for error parameter in URL (redirected from view-loader)
@@ -302,13 +425,20 @@ INDEX_HTML = r"""<!doctype html>
         return await promptUserForKey('Stored encryption key is incorrect. Please enter the correct key.');
       }
 
-      // Check localStorage first (persistent)
-      let stored = localStorage.getItem('chat-search-encryption-key');
-      if (stored) return stored;
+      // A previous version stored the raw password. Do not reuse it.
+      localStorage.removeItem(LEGACY_PASSWORD_STORAGE_KEY);
+      sessionStorage.removeItem(LEGACY_PASSWORD_STORAGE_KEY);
 
-      // Check sessionStorage second (session only)
-      stored = sessionStorage.getItem('chat-search-encryption-key');
-      if (stored) return stored;
+      if (hasStoredUnlock(localStorage)) {
+        pagefindCacheIsSessionOnly = false;
+        return CACHED_KEY_SENTINEL;
+      }
+
+      if (hasStoredUnlock(sessionStorage)) {
+        pagefindCacheIsSessionOnly = true;
+        movePagefindCache(sessionStorage, localStorage);
+        return CACHED_KEY_SENTINEL;
+      }
 
       // Prompt user for key
       return await promptUserForKey();
@@ -343,17 +473,24 @@ INDEX_HTML = r"""<!doctype html>
 
           try {
             // Validate key by attempting to initialize Pagefind
-            await options({
-              encryptionKey: key
-            });
+            await configurePagefindEncryption(key);
             await init();
             await preload('');
 
-            // Success! Store key based on user preference
+            const derivedKeyHex = await deriveConversationKeyHex(key);
             if (remember) {
-              localStorage.setItem('chat-search-encryption-key', key);
+              clearStorageUnlock(sessionStorage);
+              localStorage.setItem(DERIVED_KEY_STORAGE_KEY, derivedKeyHex);
+              pagefindCacheIsSessionOnly = false;
             } else {
-              sessionStorage.setItem('chat-search-encryption-key', key);
+              clearStorageUnlock(sessionStorage);
+              sessionStorage.setItem(DERIVED_KEY_STORAGE_KEY, derivedKeyHex);
+              pagefindCacheIsSessionOnly = true;
+            }
+            finishPagefindCacheStorage();
+            if (!remember) {
+              localStorage.removeItem(DERIVED_KEY_STORAGE_KEY);
+              localStorage.removeItem(LEGACY_PASSWORD_STORAGE_KEY);
             }
 
             keyPromptDialog.close();
@@ -379,15 +516,13 @@ INDEX_HTML = r"""<!doctype html>
           if (isEncrypted) {
             const key = await getEncryptionKey();
             try {
-              await options({
-                encryptionKey: key
-              });
+              await configurePagefindEncryption(key);
               await init();
               await preload('');
+              finishPagefindCacheStorage();
             } catch (err) {
-              // Stored key is wrong - clear it and re-prompt
-              localStorage.removeItem('chat-search-encryption-key');
-              sessionStorage.removeItem('chat-search-encryption-key');
+              // Stored derived key is wrong or incomplete - clear it and re-prompt
+              clearStoredUnlock();
               pagefindReady = null; // Reset so we can retry
 
               // Extract meaningful error from Pagefind error
@@ -396,11 +531,10 @@ INDEX_HTML = r"""<!doctype html>
                 : 'Failed to load the search index. Please try again.';
 
               const newKey = await promptUserForKey(errorMsg);
-              await options({
-                encryptionKey: newKey
-              });
+              await configurePagefindEncryption(newKey);
               await init();
               await preload('');
+              finishPagefindCacheStorage();
             }
           } else {
             await init();
@@ -420,12 +554,14 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
 
-      const makeUrlWithQuery = (url) => {
+      const makeUrlWithFragmentState = (url) => {
         const parts = String(url).split('#');
         const base = parts[0];
-        const hash = parts[1] ? ('#' + parts[1]) : '';
-        const joiner = base.includes('?') ? '&' : '?';
-        return base + joiner + 'q=' + encodeURIComponent(term) + hash;
+        const target = parts[1] || '';
+        const state = new URLSearchParams();
+        if (target) state.set('target', target);
+        state.set('q', term);
+        return base + '#' + state.toString();
       };
 
       const formatTs = (iso) => {
@@ -481,7 +617,7 @@ INDEX_HTML = r"""<!doctype html>
                  encodeURIComponent(convSafe) + '.html#msg-' +
                  encodeURIComponent(msgSafe);
         }
-        const finalHref = makeUrlWithQuery(href);
+        const finalHref = makeUrlWithFragmentState(href);
 
         const el = document.createElement('article');
 
@@ -573,6 +709,25 @@ VIEW_LOADER_HTML = r"""<!doctype html>
     async function loadEncryptedConversation() {
       const loadingEl = document.getElementById('loading');
       const errorEl = document.getElementById('error');
+      const derivedKeyStorageKey = 'chat-search-conversation-derived-key';
+      const pagefindCacheKeysStorageKey = 'chat-search-pagefind-cache-keys';
+      const pagefindCachePrefix = 'pagefind:enc:pbkdf2:';
+
+      const clearDerivedKeys = (storage) => {
+        let cacheKeys = [];
+        try {
+          cacheKeys = JSON.parse(storage.getItem(pagefindCacheKeysStorageKey) || '[]');
+        } catch {
+          cacheKeys = [];
+        }
+        for (const key of cacheKeys) {
+          if (typeof key === 'string' && key.startsWith(pagefindCachePrefix)) {
+            storage.removeItem(key);
+          }
+        }
+        storage.removeItem(pagefindCacheKeysStorageKey);
+        storage.removeItem(derivedKeyStorageKey);
+      };
 
       try {
         // Parse URL parameters
@@ -585,13 +740,13 @@ VIEW_LOADER_HTML = r"""<!doctype html>
           throw new Error('Missing source or conversation ID in URL');
         }
 
-        // Get encryption key from storage
-        let key = localStorage.getItem('chat-search-encryption-key');
-        if (!key) {
-          key = sessionStorage.getItem('chat-search-encryption-key');
+        // Get the pre-derived conversation key from storage
+        let derivedKeyHex = localStorage.getItem(derivedKeyStorageKey);
+        if (!derivedKeyHex) {
+          derivedKeyHex = sessionStorage.getItem(derivedKeyStorageKey);
         }
         
-        if (!key) {
+        if (!derivedKeyHex) {
           // Redirect to index to prompt for key
           const returnUrl = encodeURIComponent(location.pathname + location.search + hash);
           window.location.href = './index.html?return=' + returnUrl;
@@ -608,7 +763,7 @@ VIEW_LOADER_HTML = r"""<!doctype html>
         const encryptedData = new Uint8Array(await response.arrayBuffer());
 
         // Decrypt using ChatCrypto
-        const crypto = new ChatCrypto(key);
+        const crypto = new ChatCrypto(null, derivedKeyHex);
         const decryptedHtml = await crypto.decryptText(encryptedData);
 
         // Replace current document with decrypted HTML
@@ -616,18 +771,18 @@ VIEW_LOADER_HTML = r"""<!doctype html>
         document.write(decryptedHtml);
         document.close();
 
-        // Restore hash if present (for message highlighting)
-        if (hash) {
-          location.hash = hash;
-        }
       } catch (err) {
         console.error('Decryption error:', err);
 
         // Check if this is a decryption failure (wrong key)
-        if (err.message && (err.message.includes('Decryption failed') || err.message.includes('wrong key'))) {
-          // Clear stored key
-          localStorage.removeItem('chat-search-encryption-key');
-          sessionStorage.removeItem('chat-search-encryption-key');
+        if (err.message && (
+          err.message.includes('Decryption failed') ||
+          err.message.includes('wrong key') ||
+          err.message.includes('derived key')
+        )) {
+          // Clear invalid derived conversation and Pagefind keys
+          clearDerivedKeys(localStorage);
+          clearDerivedKeys(sessionStorage);
 
           // Redirect to index with error message
           const returnUrl = encodeURIComponent(location.pathname + location.search + hash);
@@ -712,15 +867,27 @@ CONVERSATION_SCRIPT = """<script>
 
   formatTimes();
 
-  const q = new URLSearchParams(location.search).get('q') || '';
+  const rawFragment = location.hash.replace(/^#/, '');
+  const fragmentState = new URLSearchParams(rawFragment);
+  const targetId = fragmentState.get('target') ||
+    (rawFragment.startsWith('msg-') ? decodeURIComponent(rawFragment) : '');
+  const q = fragmentState.get('q') ||
+    new URLSearchParams(location.search).get('q') ||
+    '';
   const terms = (q.match(/"[^"]+"|\\S+/g) || [])
     .map((t) => t.replace(/^"|"$/g, ''))
     .filter((t) => t.length > 0);
   if (!terms.length) return;
 
-  const hash = location.hash || '';
-  if (!hash.startsWith('#msg-')) return;
-  const target = document.querySelector(hash);
+  if (!targetId.startsWith('msg-')) return;
+  if (fragmentState.has('target')) {
+    history.replaceState(
+      null,
+      '',
+      location.pathname + location.search + '#' + encodeURIComponent(targetId)
+    );
+  }
+  const target = document.getElementById(targetId);
   const bubble = target && target.querySelector('.bubble');
   if (!bubble) return;
   highlightIn(bubble, terms);
@@ -849,7 +1016,7 @@ def write_message_index_pages(conversations, root_dir: Path) -> int:
     return message_pages
 
 
-def write_conversation_pages(conversations, site_root: Path, encryption_key: str = None, encryption_salt: bytes = None, encryption_iterations: int = 100000, encryption_compression: str = "none") -> int:
+def write_conversation_pages(conversations, site_root: Path, encryption_key: str = None, encryption_salt: bytes = None, encryption_iterations: int = DEFAULT_ENCRYPTION_ITERATIONS, encryption_compression: str = "none") -> int:
     """Write conversation view pages (encrypted if key provided)."""
     assets_dir = site_root / "assets"
     view_root = site_root / "view"
@@ -900,7 +1067,12 @@ def write_conversation_pages(conversations, site_root: Path, encryption_key: str
     return conversation_pages
 
 
-def setup_assets(site_root: Path, encryption_enabled: bool = False):
+def setup_assets(
+    site_root: Path,
+    encryption_enabled: bool = False,
+    encryption_salt: bytes = None,
+    encryption_iterations: int = DEFAULT_ENCRYPTION_ITERATIONS,
+):
     """Set up assets directory with CSS, JS, and templates."""
     assets_dir = site_root / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
@@ -918,6 +1090,16 @@ def setup_assets(site_root: Path, encryption_enabled: bool = False):
 
     # Render index.html with encryption flag
     index_html = INDEX_HTML.replace('{is_encrypted}', 'true' if encryption_enabled else 'false')
+    encryption_config = None
+    if encryption_enabled:
+        encryption_config = {
+            "salt": encryption_salt.hex(),
+            "iterations": encryption_iterations,
+        }
+    index_html = index_html.replace(
+        '{encryption_config}',
+        json.dumps(encryption_config, separators=(",", ":")),
+    )
     (site_root / "index.html").write_text(index_html, encoding="utf-8")
     (site_root / "view-loader.html").write_text(VIEW_LOADER_HTML, encoding="utf-8")
 
@@ -1006,8 +1188,8 @@ def main(argv=None):
     parser.add_argument(
         "--encryption-iterations",
         type=int,
-        default=100000,
-        help="PBKDF2 iterations for key derivation. Default: 100000.",
+        default=DEFAULT_ENCRYPTION_ITERATIONS,
+        help=f"PBKDF2 iterations for key derivation. Default: {DEFAULT_ENCRYPTION_ITERATIONS}.",
     )
     parser.add_argument(
         "--encryption-salt",
@@ -1038,6 +1220,14 @@ def main(argv=None):
     encryption_key = os.environ.get("ENCRYPTION_KEY") or args.encryption_key
     encryption_iterations = args.encryption_iterations
     encryption_compression = args.encryption_compression if encryption_key else "none"
+
+    if encryption_key and not (
+        MIN_ENCRYPTION_ITERATIONS <= encryption_iterations <= MAX_ENCRYPTION_ITERATIONS
+    ):
+        parser.error(
+            "--encryption-iterations must be between "
+            f"{MIN_ENCRYPTION_ITERATIONS} and {MAX_ENCRYPTION_ITERATIONS}"
+        )
 
     # Validate encryption key
     if encryption_key == "CHANGEME":
@@ -1089,7 +1279,12 @@ def main(argv=None):
 
     # Step 2: Set up assets and templates
     print("\n=== Step 2/5: Setting up assets ===")
-    setup_assets(site_root, encryption_enabled=bool(encryption_key))
+    setup_assets(
+        site_root,
+        encryption_enabled=bool(encryption_key),
+        encryption_salt=encryption_salt,
+        encryption_iterations=encryption_iterations,
+    )
     print("Assets and templates ready")
 
     # Step 3: Generate message index pages (for Pagefind)
